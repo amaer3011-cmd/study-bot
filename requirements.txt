@@ -1,0 +1,6 @@
+python-telegram-bot[job-queue]==21.6
+asyncpg>=0.29
+Pillow>=10.3
+arabic-reshaper>=3.0
+python-bidi>=0.5
+tzdata

@@ -1,0 +1,3 @@
+# libraqm لازم لتشكيل العربي في الشهادة (Pillow)
+[phases.setup]
+aptPkgs = ["libraqm0", "libfribidi0", "libharfbuzz0b", "fonts-noto-core"]
