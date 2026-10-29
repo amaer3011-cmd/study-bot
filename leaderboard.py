@@ -16,17 +16,20 @@ from certificate import (CREAM, GOLD, GOLD_D, GOLD_L, GOLD_STOPS, MUTED, NAVY_ED
 SS = 1.5
 W = 1080
 
-GOLD_M = [(0, (255, 236, 168)), (0.5, (233, 196, 106)), (1, (160, 116, 40))]
-SILVER_M = [(0, (246, 249, 255)), (0.5, (200, 208, 222)), (1, (126, 138, 158))]
-BRONZE_M = [(0, (246, 196, 140)), (0.5, (210, 140, 80)), (1, (128, 74, 36))]
+GOLD_M = [(0, (194, 239, 222)), (0.5, (90, 190, 158)), (1, (31, 132, 112))]
+SILVER_M = [(0, (248, 250, 249)), (0.5, (221, 231, 228)), (1, (176, 193, 190))]
+BRONZE_M = [(0, (255, 224, 207)), (0.5, (239, 155, 121)), (1, (201, 103, 77))]
 MEDALS = {1: GOLD_M, 2: SILVER_M, 3: BRONZE_M}
-MEDAL_RING = {1: (240, 206, 118), 2: (212, 220, 234), 3: (216, 150, 92)}
-GREEN = (112, 224, 156)
-ORANGE = (255, 150, 64)
-AV_COLORS = [(46, 134, 171), (142, 84, 196), (222, 120, 60), (206, 72, 120),
-             (52, 152, 108), (70, 110, 210), (190, 150, 40), (60, 160, 170)]
-LEVEL_COLORS = {"أسطورة": (255, 210, 90), "متفوق": (190, 150, 255), "مثابر": (255, 150, 90),
-                "مجتهد": (110, 190, 255), "مبتدئ": (150, 215, 160)}
+MEDAL_RING = {1: (31, 132, 112), 2: (176, 193, 190), 3: (201, 103, 77)}
+CREAM, GOLD, GOLD_D, GOLD_L = (31, 48, 48), (31, 132, 112), (22, 94, 84), (82, 171, 146)
+MUTED, NAVY_EDGE = (104, 123, 122), (238, 244, 241)
+GREEN = (39, 139, 93)
+ORANGE = (222, 112, 78)
+ACCENT_STOPS = [(0, (99, 190, 161)), (0.5, (45, 151, 126)), (1, (24, 112, 101))]
+AV_COLORS = [(55, 137, 148), (125, 112, 171), (205, 125, 91), (186, 91, 117),
+             (67, 145, 116), (86, 119, 177), (175, 139, 73), (63, 151, 151)]
+LEVEL_COLORS = {"أسطورة": (145, 104, 28), "متفوق": (113, 88, 161), "مثابر": (183, 89, 57),
+                "مجتهد": (49, 112, 151), "مبتدئ": (50, 125, 82)}
 
 MOTIVATION = [
     "المركز الأول مستنيك.. ابدأ معسكرك دلوقتي",
@@ -60,7 +63,7 @@ def T(img, x, y, s, kind, size, fill, anchor="mm"):
     ImageDraw.Draw(img).text((p(x), p(y)), _ar(s), font=font(kind, size), fill=fill, anchor=anchor)
 
 
-def GT(img, x, y, s, kind, size, stops=GOLD_STOPS, anchor="mm"):
+def GT(img, x, y, s, kind, size, stops=ACCENT_STOPS, anchor="mm"):
     mask = Image.new("L", img.size, 0)
     ImageDraw.Draw(mask).text((p(x), p(y)), _ar(s), font=font(kind, size), fill=255, anchor=anchor)
     box = mask.getbbox()
@@ -162,9 +165,9 @@ def _crown(img, cx, cy, w, h):
     box = m.getbbox()
     img.paste(_vgrad(box[2] - box[0], box[3] - box[1], GOLD_M), (box[0], box[1]), m.crop(box))
     dd = ImageDraw.Draw(img)
-    dd.rectangle((p(cx - w), p(cy + h * 0.72), p(cx + w), p(cy + h * 0.80)), fill=(150, 108, 36))
+    dd.rectangle((p(cx - w), p(cy + h * 0.72), p(cx + w), p(cy + h * 0.80)), fill=(22, 94, 84))
     for x in (cx - w * 0.5, cx, cx + w * 0.5):
-        dd.ellipse((p(x - h * 0.1), p(cy + h * 0.38), p(x + h * 0.1), p(cy + h * 0.58)), fill=(150, 108, 36))
+        dd.ellipse((p(x - h * 0.1), p(cy + h * 0.38), p(x + h * 0.1), p(cy + h * 0.58)), fill=(22, 94, 84))
 
 
 def _crescent(img, cx, cy, r):
@@ -222,56 +225,39 @@ def _avatar(img, cx, cy, r, name, uid, ring=None, ring_w=5, photo=None):
 
 def _done_badge(img, cx, cy, r):
     d = ImageDraw.Draw(img)
-    d.ellipse((p(cx - r - 3), p(cy - r - 3), p(cx + r + 3), p(cy + r + 3)), fill=NAVY_EDGE)
+    d.ellipse((p(cx - r - 3), p(cy - r - 3), p(cx + r + 3), p(cy + r + 3)), fill=(255, 255, 255))
     d.ellipse((p(cx - r), p(cy - r), p(cx + r), p(cy + r)), fill=GREEN)
-    _check(d, cx, cy, r * 1.05, NAVY_EDGE, r * 0.28)
+    _check(d, cx, cy, r * 1.05, (255, 255, 255), r * 0.28)
 
 
 # ───────────── الخلفية ─────────────
 def _background(h):
-    img = _vgrad(p(W), p(h), [(0, (8, 18, 40)), (0.35, (14, 36, 66)), (0.7, (12, 30, 56)), (1, (6, 13, 28))])
-    # شبكة نجوم ثمانية خفيفة
-    cell = 120
-    pat = Image.new("L", img.size, 0)
-    d = ImageDraw.Draw(pat)
-    for gy in range(-1, int(h / cell) + 2):
-        for gx in range(-1, int(W / cell) + 2):
-            cx, cy = gx * cell, gy * cell
-            for rot in (0, 45):
-                pts = [(p(cx + cell / 2 * math.cos(math.radians(rot + k * 90))),
-                        p(cy + cell / 2 * math.sin(math.radians(rot + k * 90)))) for k in range(4)]
-                d.line(pts + [pts[0]], fill=255, width=max(1, p(1.4)))
-    pat = pat.point(lambda v: int(v * 0.07))
-    img.paste(Image.new("RGB", img.size, GOLD), (0, 0), pat)
-    # نجوم صغيرة متناثرة
-    rnd = random.Random(7)
+    img = _vgrad(p(W), p(h), [(0, (249, 251, 248)), (0.52, (242, 247, 244)), (1, (234, 242, 238))])
+    # لطخات لونية هادئة تحافظ على خفة التصميم بدون شبكة وزخارف مشتتة.
+    glow(img, W - 50, 130, 220, (218, 240, 231), 0.34)
+    glow(img, 55, h - 140, 210, (250, 226, 213), 0.26)
     dd = ImageDraw.Draw(img)
-    for _ in range(int(h / 22)):
-        _star(dd, rnd.randint(20, W - 20), rnd.randint(20, int(h) - 20), rnd.choice([2.5, 3.5, 5, 7]),
-              rnd.choice([(70, 92, 134), (92, 112, 150), (120, 130, 150)]))
-    # إطار رفيع
-    dd.rectangle((p(14), p(14), p(W - 14), p(h - 14)), outline=GOLD_D, width=p(2))
-    dd.rectangle((p(24), p(24), p(W - 24), p(h - 24)), outline=(90, 74, 44), width=p(1))
+    dd.rounded_rectangle((p(18), p(18), p(W - 18), p(h - 18)), radius=p(28), outline=(220, 232, 226), width=p(2))
     return img
 
 
 # ───────────── الأجزاء ─────────────
 def _header(img, y0, group, title_sub, chips):
     cx = W / 2
-    glow(img, cx, y0 + 215, 330, (40, 100, 150), 0.35)
+    glow(img, cx, y0 + 215, 330, (210, 239, 227), 0.30)
     _crescent(img, cx, y0 + 70, 30)
     # اسم الجروب
     gs = fit(group, "bold", 36, 640, 22)
     gw = min(760, tw(group, "bold", gs) + 120)
-    panel(img, (cx - gw / 2, y0 + 112, cx + gw / 2, y0 + 168), 28, fill=(16, 62, 84, 190), outline=GOLD + (255,), width=2)
+    panel(img, (cx - gw / 2, y0 + 112, cx + gw / 2, y0 + 168), 28, fill=(255, 255, 255, 235), outline=(203, 226, 216, 255), width=1.5)
     GT(img, cx, y0 + 140, group, "bold", gs)
     # العنوان
-    GT(img, cx, y0 + 250, "لوحة الشرف", "ruqaa", 124, GOLD_M)
+    GT(img, cx, y0 + 250, "لوحة الشرف", "xbold", 82, ACCENT_STOPS)
     d = ImageDraw.Draw(img)
     for sgn in (-1, 1):
-        d.line([(p(cx + sgn * 40), p(y0 + 330)), (p(cx + sgn * 200), p(y0 + 330))], fill=GOLD, width=p(2.5))
+        d.line([(p(cx + sgn * 40), p(y0 + 330)), (p(cx + sgn * 200), p(y0 + 330))], fill=(190, 219, 207), width=p(2))
         _diamond(d, cx + sgn * 214, y0 + 330, 5, GOLD)
-    _diamond(d, cx, y0 + 330, 10, GOLD)
+    _diamond(d, cx, y0 + 330, 7, GOLD)
     T(img, cx, y0 + 372, title_sub, "medium", 34, MUTED)
     # شرائح الإحصائيات (من اليمين لليسار)
     n = len(chips)
@@ -281,7 +267,7 @@ def _header(img, y0, group, title_sub, chips):
     for i, (label, value, color) in enumerate(chips):
         x1 = x_right - i * (cw + gap)
         x0 = x1 - cw
-        panel(img, (x0, y0 + 410, x1, y0 + 494), 22, fill=(255, 255, 255, 18), outline=GOLD + (90,), width=1.5)
+        panel(img, (x0, y0 + 410, x1, y0 + 494), 20, fill=(255, 255, 255, 222), outline=(220, 231, 226, 255), width=1)
         T(img, (x0 + x1) / 2, y0 + 436, label, "regular", 24, MUTED)
         T(img, (x0 + x1) / 2, y0 + 470, value, "xbold", 38, color)
     return y0 + 520
@@ -289,17 +275,17 @@ def _header(img, y0, group, title_sub, chips):
 
 def _banner(img, y0, hours_text, done, total):
     x0, x1 = 40, W - 40
-    panel(img, (x0, y0, x1, y0 + 112), 30, fill=(255, 150, 64, 34), outline=ORANGE + (230,), width=2.5)
+    panel(img, (x0, y0, x1, y0 + 112), 26, fill=(255, 245, 239, 245), outline=(241, 208, 192, 255), width=1.5)
     _flame(img, x1 - 70, y0 + 56, 32)
-    T(img, x1 - 130, y0 + 38, f"تحدي اليوم: مذاكرة {hours_text}", "xbold", 38, (255, 226, 170), "rm")
+    T(img, x1 - 130, y0 + 38, f"تحدي اليوم: مذاكرة {hours_text}", "xbold", 36, (92, 61, 53), "rm")
     sub = (f"أنجزه {done} من {total} — كمّل واستلم شهادة باسمك" if done
            else "لسه محدش أنجزه — كن أول واحد ياخد الشهادة!")
-    T(img, x1 - 130, y0 + 80, sub, "regular", 28, (240, 200, 160), "rm")
+    T(img, x1 - 130, y0 + 80, sub, "regular", 27, (132, 101, 90), "rm")
     # علم النهاية على الشمال
     d = ImageDraw.Draw(img)
     fx = x0 + 70
-    d.line([(p(fx), p(y0 + 28)), (p(fx), p(y0 + 86))], fill=GOLD_L, width=p(4))
-    d.polygon([(p(fx), p(y0 + 28)), (p(fx + 44), p(y0 + 40)), (p(fx), p(y0 + 54))], fill=GOLD)
+    d.line([(p(fx), p(y0 + 28)), (p(fx), p(y0 + 86))], fill=GOLD, width=p(4))
+    d.polygon([(p(fx), p(y0 + 28)), (p(fx + 44), p(y0 + 40)), (p(fx), p(y0 + 54))], fill=ORANGE)
     return y0 + 112 + 26
 
 
@@ -308,18 +294,18 @@ def _podium(img, y0, top3, target):
     cols = {1: (W / 2, 300, 236, 80), 2: (W / 2 - 345, 280, 168, 62), 3: (W / 2 + 345, 280, 128, 62)}
     d = ImageDraw.Draw(img)
     # أرضية المنصّة
-    d.line([(p(40), p(base)), (p(W - 40), p(base))], fill=GOLD_D, width=p(3))
-    glow(img, W / 2, base - 20, 360, (233, 196, 106), 0.10)
+    d.line([(p(40), p(base)), (p(W - 40), p(base))], fill=(201, 218, 210), width=p(2))
+    glow(img, W / 2, base - 20, 360, (192, 231, 216), 0.22)
     for i in range(len(top3) + 1, 4):            # مراكز فاضية = تحفيز
         cx, w, h, ar = cols[i]
         top = base - h
-        panel(img, (cx - w / 2, top, cx + w / 2, base), 18, fill=(255, 255, 255, 8), outline=GOLD + (70,), width=2)
-        T(img, cx, top + h * 0.50, str(i), "xbold", 112 if i == 1 else 84, (70, 92, 128))
-        T(img, cx, top - 28, "ممكن يبقى ليك!", "bold", 30, (255, 190, 130))
+        panel(img, (cx - w / 2, top, cx + w / 2, base), 18, fill=(255, 255, 255, 145), outline=(215, 228, 222, 255), width=1.5)
+        T(img, cx, top + h * 0.50, str(i), "xbold", 112 if i == 1 else 84, (179, 196, 190))
+        T(img, cx, top - 28, "ممكن يبقى ليك!", "bold", 28, ORANGE)
         T(img, cx, top - 70, "المركز فاضي", "medium", 28, MUTED)
         d.ellipse((p(cx - ar * 0.7), p(top - 70 - 34 - ar * 1.4), p(cx + ar * 0.7), p(top - 70 - 34)),
-                  outline=GOLD + (80,), width=p(3))
-        T(img, cx, top - 70 - 34 - ar * 0.7, "?", "xbold", ar * 0.9, (90, 110, 146))
+                  outline=(205, 222, 214), width=p(3))
+        T(img, cx, top - 70 - 34 - ar * 0.7, "?", "xbold", ar * 0.9, (139, 163, 155))
     for i, r in enumerate(top3, 1):
         cx, w, h, ar = cols[i]
         top = base - h
@@ -333,15 +319,15 @@ def _podium(img, y0, top3, target):
                      [(0, stops[0][1]), (0.35, stops[1][1]), (1, tuple(int(c * 0.42 + 14) for c in stops[2][1]))])
         img.paste(col, (box[0], box[1]), m.crop(box))
         d = ImageDraw.Draw(img)
-        d.line([(p(cx - w / 2 + 14), p(top + 3)), (p(cx + w / 2 - 14), p(top + 3))], fill=(255, 255, 255), width=p(2))
-        T(img, cx, top + h * 0.50, str(i), "xbold", 112 if i == 1 else 84, (14, 30, 54))
+        d.line([(p(cx - w / 2 + 14), p(top + 3)), (p(cx + w / 2 - 14), p(top + 3))], fill=(255, 255, 255, 230), width=p(2))
+        T(img, cx, top + h * 0.50, str(i), "xbold", 112 if i == 1 else 84, (24, 83, 75))
         # الوقت والاسم والأفاتار فوق العمود
-        T(img, cx, top - 28, fmt_time(r["secs"]), "xbold", 42 if i == 1 else 36, GOLD_L if i == 1 else CREAM)
+        T(img, cx, top - 28, fmt_time(r["secs"]), "xbold", 42 if i == 1 else 36, GOLD_D)
         nm = clean_name(r["name"], "مجهول")
         T(img, cx, top - 74, nm, "bold", fit(nm, "bold", 38 if i == 1 else 32, w - 10, 20), CREAM)
         acy = top - 74 - 30 - ar
         if i == 1:
-            glow(img, cx, acy, 120, (240, 200, 90), 0.55)
+            glow(img, cx, acy, 120, (180, 226, 210), 0.45)
             _crown(img, cx, acy - ar - 34, 36, 30)
         _avatar(img, cx, acy, ar, r["name"], r["user_id"], ring=MEDAL_RING[i], ring_w=7 if i == 1 else 5,
                 photo=r.get("_photo"))
@@ -355,41 +341,41 @@ def _row(img, y, rank, r, scale, target, level_fn, today):
     cy = y + 50
     secs = r["secs"]
     done = bool(target and secs >= target)
-    panel(img, (x0, y, x1, y + 100), 28,
-          fill=(233, 196, 106, 30) if done else (255, 255, 255, 16),
-          outline=(GOLD + (190,)) if done else (GOLD + (46,)), width=2 if done else 1.5)
+    panel(img, (x0, y, x1, y + 100), 24,
+          fill=(228, 246, 236, 245) if done else (255, 255, 255, 225),
+          outline=((141, 201, 168, 255) if done else (222, 232, 227, 255)), width=1.5)
     d = ImageDraw.Draw(img)
     # الترتيب
-    d.ellipse((p(x1 - 82), p(cy - 30), p(x1 - 22), p(cy + 30)), fill=(18, 52, 78), outline=GOLD_D, width=p(2.5))
-    T(img, x1 - 52, cy - 1, str(rank), "xbold", 32, GOLD_L)
+    d.ellipse((p(x1 - 82), p(cy - 30), p(x1 - 22), p(cy + 30)), fill=(226, 241, 234), outline=(184, 216, 202), width=p(1.5))
+    T(img, x1 - 52, cy - 1, str(rank), "xbold", 32, GOLD_D)
     _avatar(img, x1 - 128, cy, 32, r["name"], r["user_id"], photo=r.get("_photo"))
     nm = clean_name(r["name"], "مجهول")
     T(img, x1 - 176, cy - 20, nm, "bold", fit(nm, "bold", 34, 380, 20), CREAM, "rm")
-    T(img, x0 + 36, cy - 20, fmt_time(secs), "xbold", 38, GOLD_L, "lm")
+    T(img, x0 + 36, cy - 20, fmt_time(secs), "xbold", 36, GOLD_D, "lm")
     # الشريط
     bar_r, bar_l, bh = x1 - 176, x0 + 330, 16
     by = cy + 24
     tw_ = bar_r - bar_l
-    panel(img, (bar_l, by - bh / 2, bar_r, by + bh / 2), bh / 2, fill=(255, 255, 255, 30))
+    panel(img, (bar_l, by - bh / 2, bar_r, by + bh / 2), bh / 2, fill=(224, 233, 229, 255))
     frac = min(1.0, secs / scale) if scale else 0
     fw = max(bh, tw_ * frac)
     m = Image.new("L", img.size, 0)
     ImageDraw.Draw(m).rounded_rectangle((p(bar_r - fw), p(by - bh / 2), p(bar_r), p(by + bh / 2)), radius=p(bh / 2), fill=255)
-    stops = [(0, (255, 226, 140)), (1, (233, 196, 106))] if done else [(0, (70, 190, 200)), (1, (233, 196, 106))]
+    stops = [(0, (91, 178, 123)), (1, (44, 139, 92))] if done else [(0, (83, 188, 158)), (1, (31, 132, 112))]
     g = hgrad(p(fw), p(bh), stops).transpose(Image.FLIP_LEFT_RIGHT)
     img.paste(g, (p(bar_r - fw), p(by - bh / 2)), m.crop((p(bar_r - fw), p(by - bh / 2), p(bar_r), p(by + bh / 2))))
     # خط نهاية التحدي
     if target and scale:
         mx = bar_r - tw_ * min(1.0, target / scale)
-        d.line([(p(mx), p(by - 14)), (p(mx), p(by + 14))], fill=GOLD_L if done else ORANGE, width=p(3))
-        d.polygon([(p(mx), p(by - 14)), (p(mx - 12), p(by - 10)), (p(mx), p(by - 6))], fill=GOLD_L if done else ORANGE)
+        d.line([(p(mx), p(by - 14)), (p(mx), p(by + 14))], fill=GREEN if done else ORANGE, width=p(3))
+        d.polygon([(p(mx), p(by - 14)), (p(mx - 12), p(by - 10)), (p(mx), p(by - 6))], fill=GREEN if done else ORANGE)
     # الحالة
     if today and target:
         if done:
             _check(d, x0 + 46, by, 22, GREEN, 4)
             T(img, x0 + 66, by, "أنجز التحدي", "bold", 25, GREEN, "lm")
         else:
-            T(img, x0 + 36, by, f"باقي {fmt_time(target - secs)}", "medium", 25, (255, 190, 130), "lm")
+            T(img, x0 + 36, by, f"باقي {fmt_time(target - secs)}", "medium", 25, ORANGE, "lm")
     elif level_fn:
         lv = clean_name(level_fn(secs), "")
         T(img, x0 + 36, by, f"{lv} · {r['sessions']} معسكر", "medium", 24, LEVEL_COLORS.get(lv, MUTED), "lm")
@@ -399,13 +385,13 @@ def _footer(img, y0, bot_username):
     cx = W / 2
     d = ImageDraw.Draw(img)
     for sgn in (-1, 1):
-        d.line([(p(cx + sgn * 34), p(y0 + 14)), (p(cx + sgn * 330), p(y0 + 14))], fill=GOLD_D, width=p(2))
-    _diamond(d, cx, y0 + 14, 9, GOLD)
+        d.line([(p(cx + sgn * 34), p(y0 + 14)), (p(cx + sgn * 330), p(y0 + 14))], fill=(203, 222, 213), width=p(1.5))
+    _diamond(d, cx, y0 + 14, 7, GOLD)
     msg = random.choice(MOTIVATION)
-    GT(img, cx, y0 + 80, msg, "ruqaa", fit(msg, "ruqaa", 56, W - 160, 30), GOLD_M)
-    T(img, cx + 112, y0 + 140, "ابدأ معسكرك بالأمر", "medium", 28, CREAM)
-    panel(img, (cx - 204, y0 + 118, cx - 20, y0 + 162), 22, fill=(233, 196, 106, 40), outline=GOLD + (200,), width=1.5)
-    T(img, cx - 112, y0 + 140, "/start 2h", "bold", 28, GOLD_L)
+    GT(img, cx, y0 + 78, msg, "bold", fit(msg, "bold", 40, W - 120, 25), ACCENT_STOPS)
+    T(img, cx + 112, y0 + 140, "ابدأ معسكرك بالأمر", "medium", 27, CREAM)
+    panel(img, (cx - 204, y0 + 118, cx - 20, y0 + 162), 20, fill=(222, 241, 232, 255), outline=(180, 218, 199, 255), width=1)
+    T(img, cx - 112, y0 + 140, "/start 2h", "bold", 27, GOLD_D)
     if bot_username:
         T(img, cx, y0 + 180, "@" + bot_username, "regular", 24, MUTED)
     return y0 + 210
