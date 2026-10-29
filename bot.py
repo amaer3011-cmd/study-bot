@@ -22,6 +22,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 
 import certificate
 import leaderboard
+from adhkar import caption as adhkar_caption
 
 ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 from duas import AFTER_DUAS, DUAS
@@ -38,6 +39,8 @@ CHALLENGE_DAILY_HOUR = int(os.getenv("CHALLENGE_DAILY_HOUR", "6"))   # ساعة 
 LEADERBOARD_HOUR = int(os.getenv("LEADERBOARD_HOUR", "20"))          # ساعة نشر ترتيب اليوم (8 بالليل)
 PRAYER_CITY = os.getenv("PRAYER_CITY", "Cairo")
 PRAYER_COUNTRY = os.getenv("PRAYER_COUNTRY", "Egypt")
+ADHKAR_MORNING_HOUR = int(os.getenv("ADHKAR_MORNING_HOUR", "7"))
+ADHKAR_EVENING_HOUR = int(os.getenv("ADHKAR_EVENING_HOUR", "17"))
 DAILY_CLOSING = "ربنا يوفقكم وييسر ليكم كل عسير\nخليك بطل بكرة معاهم 💖"
 # لو 1: الشهادة بتتعمل للأدمنز بس. الافتراضي 0: التحدي يتحكم فيه الأدمن والكل يقدر يكمله.
 CHALLENGE_ADMINS_ONLY = os.getenv("CHALLENGE_ADMINS_ONLY", "0") == "1"
@@ -408,6 +411,7 @@ WELCOME = (
     "• /top — ترتيب الجروب\n"
     "• /challenge — تحدي اليوم\n"
     "• /dua — دعاء للمذاكرة\n\n"
+    "• /adhkar — ذكر الصباح أو المساء (والبوت يرسلهما يوميًا)\n\n"
     "الشهادات بتوصلك هنا في الخاص، فخلي المحادثة دي مفتوحة 🎓"
 )
 
@@ -1049,6 +1053,44 @@ async def prayer_tick(ctx: ContextTypes.DEFAULT_TYPE):
                 await _mark_dead(ctx, ch["chat_id"], e)
 
 
+async def _send_adhkar(ctx, chat_id: int, kind: str, thread_id: int | None = None):
+    """إرسال بطاقة ذكر صباح/مساء مع تخزين Telegram file_id لإعادة الاستخدام."""
+    path = os.path.join(ASSETS, "adhkar", f"{kind}.jpg")
+    file_ids = ctx.application.bot_data.setdefault("adhkar_file_ids", {})
+    photo = file_ids.get(kind)
+    if photo is None and os.path.exists(path):
+        with open(path, "rb") as f:
+            photo = f.read()
+    kw = {"message_thread_id": thread_id} if thread_id else {}
+    caption = adhkar_caption(kind)
+    if photo is not None:
+        sent = await ctx.bot.send_photo(chat_id, photo, caption=caption, parse_mode=ParseMode.HTML, **kw)
+        file_ids[kind] = sent.photo[-1].file_id
+    else:
+        await ctx.bot.send_message(chat_id, caption, parse_mode=ParseMode.HTML, **kw)
+
+
+async def adhkar_post(ctx: ContextTypes.DEFAULT_TYPE):
+    """نشر ذكر الصباح أو المساء في الجروبات النشطة."""
+    kind = ctx.job.data
+    async with pool_of(ctx).acquire() as c:
+        chats = await _recent_chats(c)
+    for ch in chats:
+        try:
+            await _send_adhkar(ctx, ch["chat_id"], kind, ch["thread_id"])
+        except TelegramError as e:
+            log.warning("%s adhkar post failed for %s: %s", kind, ch["chat_id"], e)
+            await _mark_dead(ctx, ch["chat_id"], e)
+        except Exception:
+            log.exception("%s adhkar post crashed for %s", kind, ch["chat_id"])
+
+
+async def adhkar_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    kind = "morning" if datetime.now(TZ).hour < 12 else "evening"
+    msg = update.effective_message
+    await _send_adhkar(ctx, update.effective_chat.id, kind, getattr(msg, "message_thread_id", None))
+
+
 async def friday_post(ctx: ContextTypes.DEFAULT_TYPE):
     """الجمعة: تذكير بسورة الكهف والصلاة على النبي + الصورتين."""
     if datetime.now(TZ).weekday() != 4:   # الجمعة
@@ -1111,6 +1153,7 @@ async def post_init(app: Application):
         BotCommand("top", "ترتيب الجروب"),
         BotCommand("challenge", "تحدي اليوم"),
         BotCommand("dua", "دعاء للمذاكرة"),
+        BotCommand("adhkar", "ذكر الصباح أو المساء"),
     ])
 
 
@@ -1126,13 +1169,15 @@ def main():
     app = Application.builder().token(TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
     for name, fn in [("start", start_cmd), ("help", start_cmd), ("stop", stop_cmd), ("ready", ready_cmd),
                      ("end", end_cmd), ("me", me_cmd), ("top", top_cmd), ("challenge", challenge_cmd),
-                     ("dua", dua_cmd)]:
+                     ("dua", dua_cmd), ("adhkar", adhkar_cmd)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^(join|top):"))
     app.add_error_handler(on_error)
     app.job_queue.run_repeating(tick, interval=TICK_SECONDS, first=3)
     app.job_queue.run_daily(daily_challenge_post, time=dtime(CHALLENGE_DAILY_HOUR, 0, tzinfo=TZ))
     app.job_queue.run_daily(daily_leaderboard_post, time=dtime(LEADERBOARD_HOUR, 0, tzinfo=TZ))
+    app.job_queue.run_daily(adhkar_post, time=dtime(ADHKAR_MORNING_HOUR, 0, tzinfo=TZ), data="morning")
+    app.job_queue.run_daily(adhkar_post, time=dtime(ADHKAR_EVENING_HOUR, 0, tzinfo=TZ), data="evening")
     app.job_queue.run_daily(friday_post, time=dtime(10, 0, tzinfo=TZ))
     app.job_queue.run_repeating(prayer_tick, interval=30, first=10)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
