@@ -13,7 +13,7 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps
 from certificate import (CREAM, GOLD, GOLD_D, GOLD_L, GOLD_STOPS, MUTED, NAVY_EDGE, _ar, _font as _cfont,
                          _vgrad, clean_name)
 
-SS = 1.5
+SS = 2.0  # إخراج عالي الدقة: ضعف أبعاد نسخة العرض المعتادة
 W = 1080
 
 GOLD_M = [(0, (194, 239, 222)), (0.5, (90, 190, 158)), (1, (31, 132, 112))]
@@ -440,9 +440,9 @@ def make_leaderboard(rows, period: str, group_name: str | None, date_label: str,
         y += 112
     _footer(img, y + 6, bot_username)
 
-    out = img.resize((W, int(H)), Image.LANCZOS)
+    out = img.resize((W * 2, int(H * 2)), Image.LANCZOS)
     buf = io.BytesIO()
-    out.save(buf, "JPEG", quality=92, optimize=True)
+    out.save(buf, "JPEG", quality=95, subsampling=0, optimize=True)
     buf.seek(0)
     buf.name = "leaderboard.jpg"
     return buf
