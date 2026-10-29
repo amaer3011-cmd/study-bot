@@ -16,6 +16,7 @@ from bidi.algorithm import get_display
 from PIL import Image, ImageChops, ImageDraw, ImageFont, features
 
 HAS_RAQM = features.check("raqm")
+_FALLBACK_RESHAPER = arabic_reshaper.ArabicReshaper(configuration={"support_ligatures": False})
 
 FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 _GF = "https://github.com/google/fonts/raw/main/ofl/"
@@ -41,17 +42,17 @@ FONTS = {
 SS = 2                      # تكبير للتنعيم (بنرسم 2x وبعدين نصغّر)
 W, H = 1754, 1240           # A4 أفقي
 
-NAVY_EDGE = (6, 13, 28)
-NAVY_MID = (18, 44, 74)
-TEAL = (16, 62, 84)
-GOLD = (233, 196, 106)
-GOLD_L = (252, 231, 160)
-GOLD_D = (172, 128, 48)
-GOLD_STOPS = [(0, GOLD_L), (0.45, GOLD), (1, GOLD_D)]
-CREAM = (248, 244, 233)
-MUTED = (160, 176, 200)
-CRIMSON = (139, 27, 47)
-CRIMSON_D = (96, 16, 32)
+NAVY_EDGE = (235, 243, 239)
+NAVY_MID = (250, 251, 248)
+TEAL = (31, 132, 112)
+GOLD = (31, 132, 112)
+GOLD_L = (112, 192, 163)
+GOLD_D = (22, 94, 84)
+GOLD_STOPS = [(0, (174, 224, 201)), (0.45, GOLD), (1, GOLD_D)]
+CREAM = (31, 48, 48)
+MUTED = (100, 120, 117)
+CRIMSON = (225, 121, 85)
+CRIMSON_D = (183, 86, 63)
 
 
 # ───────────── الخطوط والنصوص ─────────────
@@ -74,7 +75,7 @@ def _font(kind: str, size: int) -> ImageFont.FreeTypeFont:
 def _ar(text: str) -> str:
     if HAS_RAQM:
         return text
-    return get_display(arabic_reshaper.reshape(text))
+    return get_display(_FALLBACK_RESHAPER.reshape(text))
 
 
 def clean_name(name: str, fallback: str = "طالب مجتهد") -> str:
@@ -179,29 +180,13 @@ def _background():
     w, h = _p(W), _p(H)
     rad = Image.radial_gradient("L").resize((w, h), Image.BICUBIC)       # 0 مركز → 255 أطراف
     img = Image.composite(Image.new("RGB", (w, h), NAVY_EDGE), Image.new("RGB", (w, h), NAVY_MID), rad)
-
-    # شبكة زخرفة إسلامية خفيفة، أقوى عند الأطراف وبتخف ناحية النص
-    cell = 104
-    pat = Image.new("L", (w, h), 0)
-    d = ImageDraw.Draw(pat)
-    for gy in range(-1, int(H / cell) + 2):
-        for gx in range(-1, int(W / cell) + 2):
-            cx, cy = gx * cell, gy * cell
-            a, b = _star_pts(_p(cx), _p(cy), _p(cell / 2))
-            for poly in (a, b):
-                d.line(poly + [poly[0]], fill=255, width=_p(1.6))
-            d.ellipse((_p(cx + cell / 2 - 4), _p(cy + cell / 2 - 4), _p(cx + cell / 2 + 4), _p(cy + cell / 2 + 4)), fill=255)
-    fade = rad.point(lambda v: int(40 + v * 0.75))
-    pat = ImageChops.multiply(pat, fade).point(lambda v: int(v * 0.16))
-    img.paste(Image.new("RGB", (w, h), GOLD), (0, 0), pat)
     return img
 
 
 def _frame(img):
     d = ImageDraw.Draw(img)
-    d.rectangle((_p(40), _p(40), _p(W - 40), _p(H - 40)), outline=GOLD, width=_p(6))
-    d.rectangle((_p(62), _p(62), _p(W - 62), _p(H - 62)), outline=GOLD_D, width=_p(2))
-    d.rectangle((_p(74), _p(74), _p(W - 74), _p(H - 74)), outline=(120, 96, 52), width=_p(1))
+    d.rounded_rectangle((_p(40), _p(40), _p(W - 40), _p(H - 40)), radius=_p(22), outline=(177, 213, 197), width=_p(3))
+    d.rounded_rectangle((_p(56), _p(56), _p(W - 56), _p(H - 56)), radius=_p(17), outline=(222, 234, 228), width=_p(1.5))
     # ميداليات الأركان
     for cx, cy in ((51, 51), (W - 51, 51), (51, H - 51), (W - 51, H - 51)):
         _octagram(d, cx, cy, 44, fill=NAVY_EDGE, outline=GOLD, width=3)
@@ -262,7 +247,7 @@ def _ribbon(img, cx, cy, w, h):
                 (inner, y1 + h * 0.22)]
         d.polygon([(_p(x), _p(y)) for x, y in tail], fill=CRIMSON_D, outline=GOLD_D)
     body = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
-    d.polygon([(_p(x), _p(y)) for x, y in body], fill=TEAL)
+    d.polygon([(_p(x), _p(y)) for x, y in body], fill=(226, 241, 234))
     d.line([(_p(x0), _p(y0)), (_p(x1), _p(y0)), (_p(x1), _p(y1)), (_p(x0), _p(y1)), (_p(x0), _p(y0))], fill=GOLD, width=_p(3))
     d.line([(_p(x0 + 8), _p(y0 + 8)), (_p(x1 - 8), _p(y0 + 8)), (_p(x1 - 8), _p(y1 - 8)), (_p(x0 + 8), _p(y1 - 8)),
             (_p(x0 + 8), _p(y0 + 8))], fill=GOLD_D, width=_p(1.2))
@@ -287,14 +272,14 @@ def _seal(img, cx, cy, r, label):
     _gold_fill(img, m)
     d = ImageDraw.Draw(img)
     d.ellipse((_p(cx - r * 0.80), _p(cy - r * 0.80), _p(cx + r * 0.80), _p(cy + r * 0.80)), outline=GOLD_D, width=_p(3))
-    d.ellipse((_p(cx - r * 0.72), _p(cy - r * 0.72), _p(cx + r * 0.72), _p(cy + r * 0.72)), outline=(255, 240, 190), width=_p(1.5))
-    _octagram(d, cx, cy - r * 0.12, r * 0.50, fill=None, outline=(150, 108, 36), width=2)
+    d.ellipse((_p(cx - r * 0.72), _p(cy - r * 0.72), _p(cx + r * 0.72), _p(cy + r * 0.72)), outline=(226, 245, 236), width=_p(1.5))
+    _octagram(d, cx, cy - r * 0.12, r * 0.50, fill=None, outline=(22, 94, 84), width=2)
     # علامة صح
     ck = [(cx - r * 0.26, cy - r * 0.10), (cx - r * 0.07, cy + r * 0.10), (cx + r * 0.30, cy - r * 0.32)]
-    d.line([(_p(x), _p(y)) for x, y in ck], fill=NAVY_EDGE, width=_p(r * 0.13), joint="curve")
+    d.line([(_p(x), _p(y)) for x, y in ck], fill=CREAM, width=_p(r * 0.13), joint="curve")
     for x, y in (ck[0], ck[2]):
-        d.ellipse((_p(x - r * 0.065), _p(y - r * 0.065), _p(x + r * 0.065), _p(y + r * 0.065)), fill=NAVY_EDGE)
-    _text(img, cx, cy + r * 0.50, label, "xbold", r * 0.25, NAVY_EDGE)
+        d.ellipse((_p(x - r * 0.065), _p(y - r * 0.065), _p(x + r * 0.065), _p(y + r * 0.065)), fill=CREAM)
+    _text(img, cx, cy + r * 0.50, label, "xbold", r * 0.25, CREAM)
 
 
 _TITLES = {"د", "م", "أ", "ا", "أ.د", "ا.د", "dr", "eng", "mr", "mrs", "ms", "prof", "دكتور", "دكتورة", "الدكتور",
@@ -325,7 +310,7 @@ def _signature(img, cx, cy, name):
         sd.ellipse((_p(x - rad), _p(yy - rad), _p(x + rad), _p(yy + rad)), fill=255)
     layer = ImageChops.lighter(layer, sw)
     layer = layer.rotate(-4 if arabic else 4, resample=Image.BICUBIC, center=(_p(cx), _p(cy)))
-    img.paste(Image.new("RGB", img.size, GOLD_L), (0, 0), layer)
+    img.paste(Image.new("RGB", img.size, GOLD_D), (0, 0), layer)
 
 
 def _info_block(img, cx, line_y, w):
@@ -373,7 +358,9 @@ def make_certificate(name: str, username: str | None, hours: int, date_str: str,
 
     # سبب المنح
     _text(img, cx, 836, "تقديرًا لإنجازه تحدي اليوم بنجاح", "regular", 44, MUTED)
-    _gold_text(img, cx, 910, f"مذاكرة {hours_label(hours)}", "ruqaa", 90)
+    achievement = f"مذاكرة {hours_label(hours)}"
+    achievement_size = _fit(achievement, "ruqaa", 90, 560, 54)
+    _gold_text(img, cx, 910, achievement, "ruqaa", achievement_size)
 
     # الختم في المنتصف
     _seal(img, cx, 1034, 72, "تحدي مكتمل")
@@ -400,7 +387,7 @@ def make_certificate(name: str, username: str | None, hours: int, date_str: str,
     if serial:
         _text(img, dx, line_y + 72, f"رقم الشهادة  {serial}", "regular", 26, MUTED)
 
-    out = img.resize((W, H), Image.LANCZOS)
+    out = img.resize((W * 2, H * 2), Image.LANCZOS)
     buf = io.BytesIO()
     out.save(buf, "PNG", optimize=True)
     buf.seek(0)
