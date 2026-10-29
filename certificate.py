@@ -19,6 +19,15 @@ HAS_RAQM = features.check("raqm")
 
 FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 _GF = "https://github.com/google/fonts/raw/main/ofl/"
+FALLBACK_ARABIC_FONTS = {
+    "regular": "DejaVuSans.ttf",
+    "medium": "DejaVuSans.ttf",
+    "bold": "DejaVuSans-Bold.ttf",
+    "xbold": "DejaVuSans-Bold.ttf",
+    "ruqaa": "DejaVuSans-Bold.ttf",
+    "ruqaa_r": "DejaVuSans.ttf",
+    "script": "DejaVuSans.ttf",
+}
 FONTS = {
     "bold": ("Tajawal-Bold.ttf", _GF + "tajawal/Tajawal-Bold.ttf"),
     "xbold": ("Tajawal-ExtraBold.ttf", _GF + "tajawal/Tajawal-ExtraBold.ttf"),
@@ -49,6 +58,11 @@ CRIMSON_D = (96, 16, 32)
 @lru_cache(maxsize=64)
 def _font(kind: str, size: int) -> ImageFont.FreeTypeFont:
     name, url = FONTS[kind]
+    # arabic_reshaper returns presentation-form codepoints. Tajawal/Aref Ruqaa
+    # are shaped by RAQM, but do not contain those forms for BASIC layout.
+    # Use bundled Noto Arabic fonts in that fallback path to prevent tofu boxes.
+    if not HAS_RAQM:
+        name = FALLBACK_ARABIC_FONTS[kind]
     path = os.path.join(FONT_DIR, name)
     if not os.path.exists(path):
         os.makedirs(FONT_DIR, exist_ok=True)
