@@ -1203,7 +1203,7 @@ async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    if os.getenv("USE_UVLOOP", "1") == "1":              # لوب أسرع بحوالي 2x لو uvloop متثبّت (اختياري)
+    if os.getenv("USE_UVLOOP", "0") == "1":              # لوب أسرع بحوالي 2x لو uvloop متثبّت (اختياري)
         try:
             import uvloop
             uvloop.install()
