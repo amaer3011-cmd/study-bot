@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """رسومات إسلامية مولّدة بالكود: بطاقات الصلوات + زخارف الشهادة."""
+import io
+import math
 import os
 import random
 
 from PIL import Image, ImageDraw, ImageFilter
 
-from certificate import _ar, _font
+import textengine as te
 
 W1, H1 = 1080, 1350          # حجم البطاقة النهائي (4:5)
 SS = 2                       # تكبير للتنعيم
@@ -140,15 +142,217 @@ def make_prayer_card(key: str, ar_name: str) -> Image.Image:
     d = ImageDraw.Draw(img)
     col, sh = st["text"], st["shadow"]
 
-    def center(text, y, font, fill):
+    def center(text, y, kind, size, fill):
         if sh:
-            d.text((W1 / 2 + 3, y + 3), _ar(text), font=font, fill=sh, anchor="mm")
-        d.text((W1 / 2, y), _ar(text), font=font, fill=fill, anchor="mm")
+            te.draw_text(img, (W1 / 2 + 3, y + 3), text, kind, size, sh)
+        te.draw_text(img, (W1 / 2, y), text, kind, size, fill)
 
-    center("بسم الله الرحمن الرحيم", 105, _font("regular", 44), col)
-    center(f"صلاة {ar_name}", 560, _font("bold", 150), col)
-    center("حان الآن موعد الأذان بتوقيت القاهرة", 665, _font("regular", 42), col)
+    center("بسم الله الرحمن الرحيم", 105, "regular", 44, col)
+    center(f"صلاة {ar_name}", 560, "bold", 150, col)
+    center("حان الآن موعد الأذان بتوقيت القاهرة", 665, "regular", 42, col)
     return img
+
+
+# ───────────── بطاقات الأدعية والأذكار ─────────────
+GOLD = (236, 200, 110)
+
+CARD_THEMES = {
+    "night": dict(stops=[(0, (10, 18, 46)), (1, (34, 54, 108))], mosque=(6, 8, 22), text=(255, 255, 255),
+                  accent=GOLD, sub=(196, 210, 240), pattern=(255, 255, 255, 30), body="moon", stars=True,
+                  window=(255, 214, 130)),
+    "emerald": dict(stops=[(0, (6, 50, 44)), (1, (20, 112, 90))], mosque=(4, 28, 24), text=(255, 250, 235),
+                    accent=GOLD, sub=(190, 228, 214), pattern=(255, 255, 255, 28), body="moon", stars=True,
+                    window=(255, 224, 140)),
+    "dawn": dict(stops=[(0, (30, 28, 82)), (0.6, (112, 76, 148)), (1, (232, 140, 134))], mosque=(22, 16, 48),
+                 text=(255, 255, 255), accent=(255, 218, 140), sub=(240, 220, 236), pattern=(255, 255, 255, 30),
+                 body="moon", stars=True, window=(255, 214, 130)),
+    "sand": dict(stops=[(0, (250, 236, 204)), (1, (255, 250, 236))], mosque=(110, 70, 34), text=(70, 40, 16),
+                 accent=(168, 112, 28), sub=(120, 82, 44), pattern=(120, 80, 30, 34), body="sun", stars=False,
+                 window=None, sun=(250, 214, 120)),
+    "sky": dict(stops=[(0, (44, 122, 206)), (1, (196, 228, 248))], mosque=(24, 62, 100), text=(10, 34, 66),
+                accent=(14, 70, 130), sub=(30, 70, 112), pattern=(255, 255, 255, 40), body="sun", stars=False,
+                window=None, sun=(255, 250, 226)),
+    # للأذكار: الصباح فاتح ودافي، المساء ليلي
+    "sunrise": dict(stops=[(0, (255, 208, 140)), (0.55, (253, 232, 190)), (1, (254, 246, 226))],
+                    mosque=(110, 64, 28), text=(74, 40, 16), accent=(176, 112, 24), sub=(126, 84, 44),
+                    pattern=(150, 100, 40, 34), body="sun", stars=False, window=None, sun=(250, 206, 110)),
+}
+DUA_THEME_ORDER = ["night", "emerald", "dawn", "sand", "sky"]
+
+
+def _star_outline(cx, cy, R, rot=0.0):
+    r = R * 0.7654
+    pts = []
+    for k in range(16):
+        a = rot + k * math.pi / 8
+        rad = R if k % 2 == 0 else r
+        pts.append((cx + rad * math.cos(a), cy + rad * math.sin(a)))
+    return pts
+
+
+def geo_pattern(w, h, color_rgba, R=64 * SS):
+    """زخرفة هندسية إسلامية خفيفة: نجوم ثمانية متلاصقة الأطراف + معينات في المسافات."""
+    layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    step = 2 * R
+    lw = max(2, SS + 1)
+    y = -R // 2
+    while y < h + step:
+        x = -R // 2
+        while x < w + step:
+            pts = _star_outline(x, y, R)
+            d.line(pts + [pts[0]], fill=color_rgba, width=lw, joint="curve")
+            q = R * 0.36                                  # معين صغير في مركز كل مربع بين 4 نجوم
+            mx, my = x + R, y + R
+            d.polygon([(mx, my - q), (mx + q, my), (mx, my + q), (mx - q, my)], outline=color_rgba, width=lw)
+            x += step
+        y += step
+    return layer
+
+
+def _frame(w, h, color):
+    layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    for inset, wd, alpha in ((44 * SS, 4 * SS, 235), (60 * SS, 2 * SS, 150)):
+        d.rounded_rectangle((inset, inset, w - inset, h - inset), radius=34 * SS,
+                            outline=color + (alpha,), width=wd)
+    return layer
+
+
+def _wrap_balanced(text, kind, size, max_w):
+    """تقسيم النص لسطور متقاربة الطول (مش سطر طويل وسطر كلمة): أول عدد سطور ممكن، وبعدها نضيّق العرض."""
+    words = text.split()
+
+    def greedy(width):
+        lines, cur = [], ""
+        for wd in words:
+            cand = f"{cur} {wd}".strip()
+            if cur and te.measure(cand, kind, size) > width:
+                lines.append(cur)
+                cur = wd
+            else:
+                cur = cand
+        if cur:
+            lines.append(cur)
+        return lines
+
+    base = greedy(max_w)
+    n = len(base)
+    lo, hi = max_w * 0.45, max_w
+    best = base
+    for _ in range(12):                                   # بحث ثنائي عن أضيق عرض يحافظ على نفس عدد السطور
+        mid = (lo + hi) / 2
+        cand = greedy(mid)
+        if len(cand) <= n:
+            best, hi = cand, mid
+        else:
+            lo = mid
+    return best
+
+
+def _fit_text(text, kind, area_w, area_h, max_size=76, min_size=38):
+    for size in range(max_size, min_size - 1, -2):
+        lines = _wrap_balanced(text, kind, size, area_w)
+        lh = size * 1.78                                  # مسافة سطور كبيرة عشان التشكيل ما يتلخبطش
+        if len(lines) * lh <= area_h and all(te.measure(l, kind, size) <= area_w for l in lines):
+            return size, lines, lh
+    size = min_size
+    return size, _wrap_balanced(text, kind, size, area_w), size * 1.78
+
+
+def _margin_stars(img, seed, n=46):
+    """نجوم صغيرة على الأطراف وفوق العنوان بس، بعيد عن مساحة النص عشان ما تلخبطش القراية."""
+    rnd = random.Random(seed)
+    d = ImageDraw.Draw(img)
+    w, h = img.size
+    keep_out = (130 * SS, 305 * SS, (W1 - 130) * SS, 905 * SS)       # مساحة النص
+    placed = 0
+    while placed < n:
+        x, y = rnd.randint(80 * SS, w - 80 * SS), rnd.randint(80 * SS, int(h * 0.72))
+        if keep_out[0] < x < keep_out[2] and keep_out[1] < y < keep_out[3]:
+            continue
+        if 640 * SS < x < 1000 * SS and 130 * SS < y < 300 * SS:      # مكان القمر/الشمس
+            continue
+        if 280 * SS < x < 800 * SS and 80 * SS < y < 305 * SS:        # البسملة والعنوان
+            continue
+        if 230 * SS < x < 850 * SS and 880 * SS < y < 990 * SS:       # سطر المصدر
+            continue
+        sparkle(d, x, y, rnd.choice([5, 7, 9, 13, 16]) * SS, (255, 244, 214))
+        placed += 1
+
+
+def make_text_card(title: str, text: str, source: str = "", theme: str = "night", seed: int = 0) -> Image.Image:
+    """بطاقة 1080×1350: بسملة + عنوان + نص (دعاء/ذكر) + مصدر، على خلفية زخرفة + جامع."""
+    st = CARD_THEMES[theme]
+    w, h = W1 * SS, H1 * SS
+    img = vgradient(w, h, st["stops"])
+    cx = w // 2
+    if st["stars"]:
+        _margin_stars(img, seed + 7)
+    b = st["body"]
+    bx, by = 900 * SS, 215 * SS
+    if b == "moon":
+        glow(img, bx, by, 150 * SS // 2 * 2, (150, 160, 230) if theme != "emerald" else (120, 200, 170), 0.5)
+        crescent(img, bx, by, 62 * SS, (255, 240, 200))
+    elif b == "sun":
+        sun = st.get("sun", (255, 246, 214))
+        glow(img, bx, by, 170 * SS, tuple(min(255, c + 12) for c in sun), 0.9)
+        disc(img, bx, by, 52 * SS, sun)
+    pat = geo_pattern(w, h, st["pattern"])
+    img = Image.alpha_composite(img.convert("RGBA"), pat).convert("RGB")
+    mosque(img, st["mosque"], k=0.75, window=st["window"])
+    img = Image.alpha_composite(img.convert("RGBA"), _frame(w, h, st["accent"])).convert("RGB")
+    img = img.resize((W1, H1), Image.LANCZOS)
+
+    d = ImageDraw.Draw(img)
+    te.draw_text(img, (W1 / 2, 118), "بسم الله الرحمن الرحيم", "ruqaa_r", 46, st["sub"])
+    te.draw_text(img, (W1 / 2, 215), title, "ruqaa", 80, st["accent"])
+    # فاصل: خطين + نجمة
+    yy = 288
+    for x0, x1 in ((W1 / 2 - 250, W1 / 2 - 34), (W1 / 2 + 34, W1 / 2 + 250)):
+        d.line((x0, yy, x1, yy), fill=st["accent"], width=2)
+    sparkle(d, W1 / 2, yy, 15, st["accent"])
+
+    area_w, top, bottom = 820, 330, 880
+    size, lines, lh = _fit_text(text, "ruqaa", area_w, bottom - top)
+    gap = 78 if source else 0                                   # مسافة بين آخر سطر والمصدر
+    block = (len(lines) - 1) * lh + gap
+    y = (top + bottom) / 2 - block / 2
+    for ln in lines:
+        te.draw_text(img, (W1 / 2, y), ln, "ruqaa", size, st["text"])
+        y += lh
+    if source:
+        te.draw_text(img, (W1 / 2, y - lh + gap + lh * 0.28), f"— {source} —", "medium", 34, st["sub"])
+    return img
+
+
+def card_jpeg(img: Image.Image, quality: int = 90) -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=quality, optimize=True)
+    return buf.getvalue()
+
+
+def dua_theme(idx: int) -> str:
+    return DUA_THEME_ORDER[idx % len(DUA_THEME_ORDER)]
+
+
+def make_dua_card(idx: int) -> bytes:
+    """بطاقة الدعاء رقم idx من duas.DUA_ITEMS كـ JPEG (الثيم ثابت لكل دعاء عشان الكاش)."""
+    from duas import CATEGORIES, DUA_ITEMS
+    text, source, cat = DUA_ITEMS[idx % len(DUA_ITEMS)]
+    title = CATEGORIES.get(cat, CATEGORIES["all"]) if cat != "study" else CATEGORIES["all"]
+    return card_jpeg(make_text_card(title, text, source, dua_theme(idx), seed=idx))
+
+
+def save_adhkar_cards(out_dir: str):
+    """morning.jpg و evening.jpg — البوت بيرسلهم تلقائي لو موجودين في assets/adhkar."""
+    from adhkar import ADHKAR, SOURCE_LABEL
+    os.makedirs(out_dir, exist_ok=True)
+    for kind, theme in (("morning", "sunrise"), ("evening", "night")):
+        item = ADHKAR[kind]
+        img = make_text_card(item["title"], item["text"], SOURCE_LABEL, theme, seed=11 if kind == "morning" else 23)
+        with open(os.path.join(out_dir, f"{kind}.jpg"), "wb") as f:
+            f.write(card_jpeg(img))
 
 
 def save_prayer_cards(out_dir: str):
@@ -158,4 +362,10 @@ def save_prayer_cards(out_dir: str):
 
 
 if __name__ == "__main__":
-    save_prayer_cards(os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "prayers"))
+    import sys
+    _base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+    _what = sys.argv[1] if len(sys.argv) > 1 else "all"           # prayers | adhkar | all
+    if _what in ("prayers", "all"):
+        save_prayer_cards(os.path.join(_base, "prayers"))
+    if _what in ("adhkar", "all"):
+        save_adhkar_cards(os.path.join(_base, "adhkar"))

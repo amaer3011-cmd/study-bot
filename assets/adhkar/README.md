@@ -5,3 +5,6 @@
 المصدر: [Jami` at-Tirmidhi 3391](https://sunnah.com/tirmidhi:3391)
 
 يرسل البوت الذكر نصيًا يوميًا في الساعة 07:00 صباحًا و17:00 مساءً بحسب `TZ_NAME`، ويمكن تعديل الساعتين عبر `ADHKAR_MORNING_HOUR` و`ADHKAR_EVENING_HOUR`. كما يعرض الأمر `/adhkar` الذكر المناسب حسب الساعة المحلية. إذا أضيفت صورة باسم `morning.jpg` أو `evening.jpg` إلى هذا المجلد، يرسلها البوت مع النص.
+
+
+الصورتان `morning.jpg` و`evening.jpg` مولّدتان بالكود من `art.py`؛ لتجديدهما: `python art.py adhkar`. يمكنك استبدالهما بأي صورة بنفس الاسم.

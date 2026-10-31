@@ -15,6 +15,7 @@ ADHKAR = {
 }
 
 SOURCE_URL = "https://sunnah.com/tirmidhi:3391"
+SOURCE_LABEL = "رواه الترمذي — حديث حسن"
 
 
 def caption(kind: str) -> str:

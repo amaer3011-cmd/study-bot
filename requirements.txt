@@ -1,6 +1,8 @@
 python-telegram-bot[job-queue]==21.6
-asyncpg>=0.29
+asyncpg>=0.29,<1
 Pillow>=10.3
-arabic-reshaper>=3.0
-python-bidi>=0.5
+# محرك رسم العربي في الشهادة واللوحة: حزم pip جاهزة (مفيش apt ولا libraqm)
+uharfbuzz>=0.39
+freetype-py>=2.4
 tzdata
+uvloop>=0.19; sys_platform != "win32"
