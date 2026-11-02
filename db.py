@@ -128,9 +128,15 @@ async def rosters(c, session_ids: list[int]) -> dict[int, tuple[int, list[str]]]
     """{session_id: (عدد المشاركين, أول أسماء)} لكل الجلسات في استعلام واحد."""
     if not session_ids:
         return {}
+    # بنجيب العدد + أول ROSTER_NAMES أسماء بس (قبل كده كل المشاركين كانوا بيتسحبوا كل تيك: 500 مشارك = 500 صف كل 10 ثواني)
     rows = await c.fetch(
-        """SELECT session_id, count(*) OVER (PARTITION BY session_id)::int AS n, full_name, username
-           FROM participants WHERE session_id = ANY($1::bigint[]) ORDER BY session_id, ctid""", session_ids)
+        """SELECT c.session_id, c.n, p.full_name, p.username
+           FROM (SELECT session_id, count(*)::int AS n FROM participants
+                 WHERE session_id = ANY($1::bigint[]) GROUP BY session_id) c
+           CROSS JOIN LATERAL (SELECT x.full_name, x.username, row_number() OVER (ORDER BY x.ctid) AS rn
+                               FROM participants x WHERE x.session_id = c.session_id
+                               ORDER BY x.ctid LIMIT $2) p
+           ORDER BY c.session_id, p.rn""", session_ids, ROSTER_NAMES)
     out: dict[int, tuple[int, list[str]]] = {}
     for r in rows:
         n, names = out.setdefault(r["session_id"], (r["n"], []))

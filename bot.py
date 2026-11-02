@@ -16,7 +16,7 @@ from datetime import datetime, time as dtime, timedelta
 from html import escape
 
 import asyncpg
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message, Update
 from telegram.constants import ChatType, ParseMode, ReactionEmoji
 from telegram.error import BadRequest, ChatMigrated, Forbidden, RetryAfter, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
@@ -29,6 +29,7 @@ import timercard
 from adhkar import caption as adhkar_caption
 from config import (ADHKAR_EVENING_HOUR, ADHKAR_MORNING_HOUR, ASSETS, BOARD_CACHE_SECONDS, BROADCAST_CONCURRENCY,
                     CHALLENGE_ADMINS_ONLY, CHALLENGE_DAILY_HOUR, CONFIRM_END_SECONDS, DAILY_CLOSING, DATABASE_URL,
+                    DB_POOL_MAX, TG_KEEPALIVE,
                     LEADERBOARD_HOUR, MAX_PAUSE_HOURS, MAX_SESSION_HOURS, POMO_MAX_BREAK, POMO_MIN_BREAK, POMO_MIN_STUDY,
                     PRAYER_CITY, PRAYER_COUNTRY, TICK_SECONDS,
                     TOKEN, TZ, log)
@@ -75,6 +76,21 @@ def thread_kwargs(msg) -> dict:
     return {"message_thread_id": msg.message_thread_id} if msg and msg.is_topic_message else {}
 
 
+def anon_admin(msg, chat) -> bool:
+    """أدمن بيكتب كـ «الجروب نفسه» (anonymous admin): تليجرام بيبعت id بوت وهمي، فـ get_chat_member مش هينفع."""
+    sc = getattr(msg, "sender_chat", None)
+    return bool(sc is not None and getattr(sc, "id", None) == chat.id)
+
+
+def spawn(ctx, coro) -> asyncio.Task:
+    """يشغّل coroutine في الخلفية من غير ما نستناها، ومع الاحتفاظ بمرجع للـ task (عشان مايتمسحش من الذاكرة)."""
+    tasks = ctx.application.bot_data.setdefault("bg_tasks", set())
+    t = asyncio.ensure_future(coro)
+    tasks.add(t)
+    t.add_done_callback(tasks.discard)
+    return t
+
+
 # ───────────── رسالة المعسكر وتحديثها ─────────────
 _GONE_MARKERS = ("message to edit not found", "message_id_invalid", "message can't be edited")
 
@@ -111,8 +127,10 @@ async def refresh(ctx, s: dict, force: bool = False, roster: tuple[int, list[str
             await _repost_session_message(ctx, s, text)       # حد مسح رسالة المعسكر: نبعتها من جديد
         else:
             log.warning("edit failed (session %s): %s", s["id"], e)
+            await _mark_dead(ctx, s["chat_id"], e)            # اتطرد/الجروب اتمسح: نبطّل رسائل الجدولة ليه
     except TelegramError as e:
         log.warning("edit error (session %s): %s", s["id"], e)
+        await _mark_dead(ctx, s["chat_id"], e)
 
 
 async def _repost_session_message(ctx, s: dict, text: str):
@@ -148,13 +166,64 @@ async def _handle_migration(ctx, old_id: int, new_id: int):
 
 
 # ───────────── دورة الحياة ─────────────
+def _seconds_to_event(s: dict, now: datetime) -> float | None:
+    """كام ثانية فاضلة لأقرب حدث (نهاية المعسكر / بداية الراحة / نهاية الراحة)، أو None لو مفيش حدث جاي."""
+    if s["status"] == "running":
+        nb = next_break_at(s)
+        target = min(s["duration"], nb) if nb is not None else s["duration"]
+        return target - eff_elapsed(s, now)
+    if s["status"] == "paused" and s.get("break_until"):
+        return (s["break_until"] - now).total_seconds()
+    return None
+
+
+async def _process_due(ctx, sid: int):
+    """بينفّذ الحدث المستحق (إنهاء/راحة/رجوع) على أحدث نسخة من الجلسة من الداتابيز."""
+    async with pool_of(ctx).acquire() as c:
+        r = await c.fetchrow("SELECT * FROM sessions WHERE id=$1", sid)
+    if not r or r["status"] == "done":
+        return
+    s, now = dict(r), now_utc()
+    if s["status"] == "running":
+        e = eff_elapsed(s, now)
+        if e >= s["duration"]:
+            await finish_session(ctx, s, defer_awards=True)
+        else:
+            nb = next_break_at(s)
+            if nb is not None and e >= nb:
+                await start_break(ctx, s, e)
+    elif s["status"] == "paused" and s.get("break_until") and now >= s["break_until"]:
+        await end_break(ctx, s)
+
+
+def _arm_due(ctx, s: dict, delay: float):
+    """المؤقت الدوري بيتحدّث كل TICK_SECONDS، فالنهاية كانت بتتأخر لحد 10 ثواني. هنا بنضبط منبّه دقيق للحدث
+    الجاي (لو قريب) فينفّذ في ثانيته بالظبط. لو الجلسة اتوقفت/اتغيرت قبله، _process_due مابيعملش حاجة."""
+    armed = ctx.application.bot_data.setdefault("armed", {})
+    old = armed.get(s["id"])
+    if old is not None and not old.done():
+        return
+
+    async def run():
+        try:
+            await asyncio.sleep(max(0.0, delay) + 0.05)
+            await _process_due(ctx, s["id"])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("armed event failed for session %s", s["id"])
+        finally:
+            armed.pop(s["id"], None)
+    armed[s["id"]] = spawn(ctx, run())
+
+
 async def _tick_one(ctx, s: dict, roster: tuple[int, list[str]], sem: asyncio.Semaphore):
     async with sem:
         try:
             now = now_utc()
             e = eff_elapsed(s, now) if s["status"] == "running" else 0
             if s["status"] == "running" and e >= s["duration"]:
-                await finish_session(ctx, s)
+                await finish_session(ctx, s, defer_awards=True)
             elif s["status"] == "running":
                 nb = next_break_at(s)
                 if nb is not None and e >= nb:
@@ -168,6 +237,9 @@ async def _tick_one(ctx, s: dict, roster: tuple[int, list[str]], sem: asyncio.Se
                     await refresh(ctx, s, roster=roster)          # عدّاد الراحة
             elif s["status"] == "paused":
                 await _check_stale_pause(ctx, s, now)
+            left = _seconds_to_event(s, now)
+            if left is not None and 0 < left <= TICK_SECONDS + 1:
+                _arm_due(ctx, s, left)
         except Exception:
             log.exception("tick failed for session %s", s["id"])
 
@@ -181,7 +253,7 @@ async def _check_stale_pause(ctx, s: dict, now: datetime):
         return
     if (now - s["paused_at"]).total_seconds() < MAX_PAUSE_HOURS * 3600:
         return
-    row = await end_early(ctx, s)
+    row = await end_early(ctx, s, defer_awards=True)
     if row:
         kw = {"message_thread_id": s["thread_id"]} if s["thread_id"] else {}
         try:
@@ -257,14 +329,14 @@ async def end_break(ctx, s: dict):
     await send_timer_card(ctx, s, "study", block, f"الفترة {n}", study_back_caption(block, n))
 
 
-async def end_early(ctx, s: dict):
+async def end_early(ctx, s: dict, defer_awards: bool = False):
     """إنهاء المعسكر فورًا؛ المدة المحسوبة = الوقت اللي فعلاً اتذاكر. بترجّع الصف لو الإنهاء تم."""
     elapsed = max(60, int(round(eff_elapsed(s, now_utc()))))
     async with pool_of(ctx).acquire() as c:
         row = await c.fetchrow("UPDATE sessions SET duration=$2 WHERE id=$1 AND status <> 'done' RETURNING *",
                                s["id"], min(elapsed, s["duration"]))
     if row:
-        await finish_session(ctx, dict(row))
+        await finish_session(ctx, dict(row), defer_awards=defer_awards)
     return row
 
 
@@ -285,7 +357,15 @@ async def _mark_dead(ctx, chat_id: int, err: Exception):
         log.info("chat %s marked dead: %s", chat_id, err)
 
 
-async def finish_session(ctx, s: dict):
+async def _award_safe(ctx, chat_id: int, thread_id: int | None):
+    try:
+        await award_check(ctx, chat_id, thread_id)
+    except Exception:
+        log.exception("award check failed for chat %s", chat_id)
+
+
+async def finish_session(ctx, s: dict, defer_awards: bool = False):
+    """defer_awards=True (من التايمر): الشهادات بتتولّد وتتبعت في الخلفية عشان تيك باقي الجلسات مايتأخرش."""
     pool = pool_of(ctx)
     async with pool.acquire() as c:
         async with c.transaction():
@@ -314,7 +394,10 @@ async def finish_session(ctx, s: dict):
             await _mark_dead(ctx, s["chat_id"], e)
             break
 
-    await award_check(ctx, s["chat_id"], s["thread_id"])
+    if defer_awards:
+        spawn(ctx, _award_safe(ctx, s["chat_id"], s["thread_id"]))
+    else:
+        await award_check(ctx, s["chat_id"], s["thread_id"])
 
 
 # ───────────── الأوامر ─────────────
@@ -351,28 +434,44 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pomo = await get_pomodoro(c, chat.id)
         try:
             async with c.transaction():
-                sid = await c.fetchval(
+                row = await c.fetchrow(        # RETURNING * بدل SELECT تاني: رحلة أقل للداتابيز
                     "INSERT INTO sessions(chat_id, thread_id, creator_id, duration, run_started, dua_idx, subject, "
-                    "pomo_study, pomo_break) VALUES($1,$2,$3,$4,now(),$5,$6,$7,$8) RETURNING id",
+                    "pomo_study, pomo_break) VALUES($1,$2,$3,$4,now(),$5,$6,$7,$8) RETURNING *",
                     chat.id, msg.message_thread_id if msg.is_topic_message else None,
                     user.id, dur, random.randrange(len(DUAS)), subject,
                     pomo[0] if pomo else None, pomo[1] if pomo else None)
+                sid = row["id"]
                 await c.execute(
                     "INSERT INTO participants(session_id,user_id,username,full_name) VALUES($1,$2,$3,$4)",
                     sid, user.id, user.username, user.full_name)
+                await c.execute("DELETE FROM dead_chats WHERE chat_id=$1", chat.id)   # البوت رجع يشتغل في الجروب
         except asyncpg.UniqueViolationError:
             await msg.reply_html("فيه معسكر شغال بالفعل في الجروب، اضغط <b>انضمام</b> على رسالته 👆")
             return
-        await c.execute("DELETE FROM dead_chats WHERE chat_id=$1", chat.id)   # البوت رجع يشتغل في الجروب
-        s = dict(await c.fetchrow("SELECT * FROM sessions WHERE id=$1", sid))
+        s = dict(row)
 
     sub = f"مدة المعسكر: {ar_duration(dur)}"
     if s.get("pomo_study") and next_break_at(s) is not None:
         sub = f"مذاكرة {ar_duration(s['pomo_study'])} وراحة {ar_duration(s['pomo_break'])}"
     await send_timer_card(ctx, s, "study", dur, sub, "")          # كارت المدة (مثلًا ساعتين) قبل رسالة المعسكر
     text = session_text(s, 1, [user.full_name], ctx.application.bot_data["username"], now_utc())
-    sent = await ctx.bot.send_message(
-        chat.id, text, parse_mode=ParseMode.HTML, reply_markup=session_keyboard(sid), **thread_kwargs(msg))
+    try:
+        sent = await ctx.bot.send_message(
+            chat.id, text, parse_mode=ParseMode.HTML, reply_markup=session_keyboard(sid), **thread_kwargs(msg))
+    except TelegramError as e:
+        # لو الرسالة ماتبعتتش (البوت مالوش صلاحية كتابة مثلًا) الجلسة كانت بتفضل «شغالة» من غير رسالة وتمنع أي /start جديد
+        log.warning("session message failed (session %s): %s", sid, e)
+        async with pool.acquire() as c:
+            await c.execute("DELETE FROM sessions WHERE id=$1", sid)
+        if isinstance(e, ChatMigrated):
+            await _handle_migration(ctx, chat.id, e.new_chat_id)
+        else:
+            await _mark_dead(ctx, chat.id, e)
+        try:
+            await msg.reply_text("ماقدرتش أبعت رسالة المعسكر 😕 اتأكد إن عندي صلاحية الكتابة في الجروب وجرّب /start تاني.")
+        except TelegramError:
+            pass
+        return
     async with pool.acquire() as c:
         await c.execute("UPDATE sessions SET message_id=$1 WHERE id=$2", sent.message_id, sid)
     ctx.application.bot_data.setdefault("last_text", {})[sid] = text
@@ -394,29 +493,29 @@ async def _controllable(update, ctx):
     if not s:
         await msg.reply_text("مفيش معسكر شغال دلوقتي. ابدأ واحد بـ /start 2h")
         return None
-    if user.id != s["creator_id"] and not await is_admin(ctx, chat.id, user.id):
+    if user.id != s["creator_id"] and not anon_admin(msg, chat) and not await is_admin(ctx, chat.id, user.id):
         await msg.reply_text("بس اللي بدأ المعسكر أو الأدمن يقدر يتحكم فيه.")
         return None
     return s
 
 
-async def pause_session(ctx, s: dict):
-    """بترجّع الصف لو الإيقاف تم (مش لو كانت موقوفة أصلًا)."""
+async def pause_session(ctx, s: dict, do_refresh: bool = True):
+    """بترجّع الصف لو الإيقاف تم (مش لو كانت موقوفة أصلًا). do_refresh=False: المنادي هيحدّث الرسالة بنفسه بعد ما يرد على الزر."""
     async with pool_of(ctx).acquire() as c:
         row = await c.fetchrow(
             "UPDATE sessions SET base_eff = LEAST(duration, base_eff + EXTRACT(EPOCH FROM (now() - run_started))), "
             "run_started=NULL, status='paused', paused_at=now() WHERE id=$1 AND status='running' RETURNING *", s["id"])
-    if row:
+    if row and do_refresh:
         await refresh(ctx, dict(row), force=True)
     return row
 
 
-async def resume_session(ctx, s: dict):
+async def resume_session(ctx, s: dict, do_refresh: bool = True):
     async with pool_of(ctx).acquire() as c:
         row = await c.fetchrow(
             "UPDATE sessions SET run_started=now(), status='running', paused_at=NULL, break_until=NULL "
             "WHERE id=$1 AND status='paused' RETURNING *", s["id"])
-    if row:
+    if row and do_refresh:
         await refresh(ctx, dict(row), force=True)
     return row
 
@@ -465,10 +564,16 @@ async def _control_button(update, ctx, action: str, sid: int, s: dict):
         await _answer(q, "بس اللي بدأ المعسكر أو الأدمن يقدر يتحكم فيه 🔒", True)
         return
     if action == "pause":
-        await _answer(q, "⏸ تم الإيقاف" if await pause_session(ctx, s)
+        row = await pause_session(ctx, s, do_refresh=False)       # نرد على الضغطة الأول (فورًا) وبعدين نحدّث الرسالة
+        await _answer(q, "⏸ تم الإيقاف" if row
                       else ("☕ إحنا في الراحة دلوقتي" if s.get("break_until") else "المؤقت متوقف بالفعل"))
+        if row:
+            await refresh(ctx, dict(row), force=True)
     elif action == "resume":
-        await _answer(q, "▶️ تم الاستئناف" if await resume_session(ctx, s) else "المؤقت شغال بالفعل")
+        row = await resume_session(ctx, s, do_refresh=False)
+        await _answer(q, "▶️ تم الاستئناف" if row else "المؤقت شغال بالفعل")
+        if row:
+            await refresh(ctx, dict(row), force=True)
     else:  # end
         pend = ctx.application.bot_data.setdefault("end_confirm", {})
         key, now = (sid, user.id), time.monotonic()
@@ -482,6 +587,34 @@ async def _control_button(update, ctx, action: str, sid: int, s: dict):
                 pend.clear()
                 pend[key] = now
             await _answer(q, "اضغط ⏹ إنهاء مرة تانية للتأكيد", True)
+
+
+JOIN_REFRESH_DELAY = 0.8
+
+
+def _schedule_refresh(ctx, sid: int, delay: float = JOIN_REFRESH_DELAY):
+    """100 طالب بيضغطوا «انضمام» في نفس اللحظة = 100 تعديل لنفس الرسالة = flood control من تليجرام.
+    هنا كل الضغطات اللي في نافذة صغيرة بتتجمّع في تعديل واحد."""
+    pending = ctx.application.bot_data.setdefault("refresh_pending", set())
+    if sid in pending:
+        return
+    pending.add(sid)
+
+    async def run():
+        try:
+            await asyncio.sleep(delay)
+            pending.discard(sid)               # أي انضمام بعد كده هيجدول تعديل جديد
+            async with pool_of(ctx).acquire() as c:
+                r = await c.fetchrow("SELECT * FROM sessions WHERE id=$1", sid)
+            if r and r["status"] != "done":
+                await refresh(ctx, dict(r), force=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("scheduled refresh failed for session %s", sid)
+        finally:
+            pending.discard(sid)
+    spawn(ctx, run())
 
 
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -512,7 +645,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await _answer(q, answer, alert)
     if changed:
-        await refresh(ctx, s, force=True)
+        _schedule_refresh(ctx, sid)
 
 
 # ───────────── ضبط البومودورو ورد القلب ─────────────
@@ -542,7 +675,7 @@ async def pomodoro_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             cfg = await get_pomodoro(c, chat.id)
         await msg.reply_html(f"{pomodoro_status(cfg)}\n\n{POMODORO_HELP}")
         return
-    if not await is_admin(ctx, chat.id, user.id):
+    if not anon_admin(msg, chat) and not await is_admin(ctx, chat.id, user.id):
         await msg.reply_text("ضبط البومودورو للأدمن بس 🔒")
         return
     if ctx.args[0].lower() in ("off", "stop", "0", "إيقاف", "ايقاف", "وقف", "تعطيل", "الغاء", "إلغاء"):
@@ -727,6 +860,8 @@ async def top_callback(update: Update, ctx, period: str):
         return
     await q.answer()
     msg = q.message
+    if not isinstance(msg, Message):       # رسالة قديمة جدًا (تليجرام مابيرجّعش محتواها): مفيش حاجة نعدّلها
+        return
     buf, caption, _ = await render_board(ctx, msg.chat_id, period, msg.chat.title)
     kb = top_keyboard(period)
     try:
@@ -769,9 +904,13 @@ def dua_keyboard(cat: str, cur: int) -> InlineKeyboardMarkup:
 
 async def _dua_photo(ctx, idx: int):
     """file_id لو البطاقة اتبعتت قبل كده، وإلا بنرسمها في thread (حوالي نص ثانية). None لو الرسم فشل."""
-    fid = ctx.application.bot_data.setdefault("dua_file_ids", {}).get(idx)
+    bd = ctx.application.bot_data
+    fid = bd.setdefault("dua_file_ids", {}).get(idx)
     if fid:
         return fid
+    pre = bd.get("dua_bytes", {}).get(idx)         # اتحضّرت وقت التشغيل: مفيش رسم (كان ~0.3 ثانية)
+    if pre:
+        return pre
     try:
         return await asyncio.to_thread(art.make_dua_card, idx)
     except Exception:
@@ -886,7 +1025,7 @@ async def challenge_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pool = pool_of(ctx)
 
     if ctx.args:  # تحديد ساعات التحدي = للأدمن فقط
-        if not await is_admin(ctx, chat.id, user.id):
+        if not anon_admin(msg, chat) and not await is_admin(ctx, chat.id, user.id):
             await msg.reply_text("تحديد التحدي للأدمنز بس 🔒")
             return
         arg = ctx.args[0].translate(_AR_DIGITS)
@@ -960,9 +1099,6 @@ async def send_certificate(ctx, chat_id, thread_id, r, hours: int, ch=None):
             r["user_id"], buf,
             caption=(f"🎓 مبروك! خلّصت تحدي اليوم ({certificate.hours_label(hours)} مذاكرة)"
                      + (f" في «{group}»" if group else "") + ".\nبارك الله في جهدك 🤍"))
-        await ctx.bot.send_message(
-            chat_id, f"🏆 مبروك {who}! خلّص تحدي اليوم ({certificate.hours_label(hours)}) والشهادة وصلتله على الخاص 🎓",
-            parse_mode=ParseMode.HTML, **kw)
     except (Forbidden, BadRequest):
         # المستخدم ماعملش Start للبوت في الخاص -> نبعتها في الجروب
         buf.seek(0)
@@ -970,6 +1106,14 @@ async def send_certificate(ctx, chat_id, thread_id, r, hours: int, ch=None):
             chat_id, buf, parse_mode=ParseMode.HTML, **kw,
             caption=(f"🏆 مبروك {who}! خلّص تحدي اليوم ({certificate.hours_label(hours)}) 🎓\n"
                      f"ابدأ البوت في الخاص عشان الشهادة توصلك مباشرة: https://t.me/{ctx.application.bot_data['username']}"))
+        return
+    # الشهادة وصلت الخاص. لو إشعار الجروب فشل (توبيك اتقفل مثلًا) ماينفعش نبعت الشهادة تاني في الجروب (كان بيحصل تكرار)
+    try:
+        await ctx.bot.send_message(
+            chat_id, f"🏆 مبروك {who}! خلّص تحدي اليوم ({certificate.hours_label(hours)}) والشهادة وصلتله على الخاص 🎓",
+            parse_mode=ParseMode.HTML, **kw)
+    except TelegramError as e:
+        log.warning("certificate group notice failed: %s", e)
 
 
 # ───────────── الإرسال الجماعي ─────────────
@@ -1117,7 +1261,8 @@ async def adhkar_post(ctx: ContextTypes.DEFAULT_TYPE):
 async def adhkar_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kind = "morning" if datetime.now(TZ).hour < 12 else "evening"
     msg = update.effective_message
-    await _send_adhkar(ctx, update.effective_chat.id, kind, getattr(msg, "message_thread_id", None))
+    # thread_kwargs مش message_thread_id الخام: في الجروبات العادية الرد على رسالة بيحمل thread id وتليجرام بيرفض الإرسال بيه
+    await _send_adhkar(ctx, update.effective_chat.id, kind, thread_kwargs(msg).get("message_thread_id"))
 
 
 async def friday_post(ctx: ContextTypes.DEFAULT_TYPE):
@@ -1126,12 +1271,19 @@ async def friday_post(ctx: ContextTypes.DEFAULT_TYPE):
         return
     async with pool_of(ctx).acquire() as c:
         chats = await recent_chats(c)
-    kahf, salawat = await asyncio.gather(asyncio.to_thread(_read, "kahf.jpg"), asyncio.to_thread(_read, "salawat.jpg"))
+    file_ids = ctx.application.bot_data.setdefault("friday_file_ids", {})
+    if file_ids:
+        kahf, salawat = file_ids["kahf"], file_ids["salawat"]
+    else:
+        kahf, salawat = await asyncio.gather(asyncio.to_thread(_read, "kahf.jpg"), asyncio.to_thread(_read, "salawat.jpg"))
     caption = "لا تنسوا قراءة سورة الكهف\nوالصلاة على النبي ﷺ 💖"
 
     async def send(ch):
-        await ctx.bot.send_media_group(
-            ch["chat_id"], [InputMediaPhoto(kahf, caption=caption), InputMediaPhoto(salawat)], **_kw(ch))
+        msgs = await ctx.bot.send_media_group(
+            ch["chat_id"], [InputMediaPhoto(file_ids.get("kahf") or kahf, caption=caption),
+                            InputMediaPhoto(file_ids.get("salawat") or salawat)], **_kw(ch))
+        if not file_ids and len(msgs) == 2 and all(getattr(m, "photo", None) for m in msgs):
+            file_ids.update(kahf=msgs[0].photo[-1].file_id, salawat=msgs[1].photo[-1].file_id)   # رفع مرة واحدة بس
     if not (kahf and salawat):
         log.warning("friday images missing")
         return
@@ -1161,25 +1313,42 @@ async def daily_leaderboard_post(ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ───────────── التشغيل ─────────────
-async def _warmup():
-    """أول شهادة/لوحة بتحتاج تحميل الخطوط وبناء الخلفيات الثابتة؛ بنعملها مرة وقت التشغيل عشان محدش يستنى."""
+def _prerender_duas(cache: dict):
+    for i in range(len(DUA_ITEMS)):
+        if i not in cache:
+            cache[i] = art.make_dua_card(i)
+
+
+async def _warmup(app: Application | None = None):
+    """أول شهادة/لوحة بتحتاج تحميل الخطوط وبناء الخلفيات الثابتة؛ بنعملها مرة وقت التشغيل عشان محدش يستنى.
+    كروت الأدعية كلها بتتحضّر كمان (بايتات في الذاكرة) فأول /dua لأي دعاء بيتبعت فورًا."""
     t0 = time.monotonic()
     try:
         await asyncio.to_thread(certificate.warmup)
         await asyncio.to_thread(leaderboard.warmup)
         await asyncio.to_thread(timercard.warmup)
         log.info("warmup done in %.1fs", time.monotonic() - t0)
+        if app is not None:
+            await asyncio.to_thread(_prerender_duas, app.bot_data.setdefault("dua_bytes", {}))
+            log.info("dua cards ready (%.1fs)", time.monotonic() - t0)
     except Exception:
         log.exception("warmup failed")
 
 
 async def post_init(app: Application):
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10, command_timeout=30)
+    pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=DB_POOL_MAX, command_timeout=30)
     async with pool.acquire() as c:
         await c.execute(SCHEMA)
     app.bot_data["pool"] = pool
     app.bot_data["username"] = (await app.bot.get_me()).username
-    app.bot_data["warmup_task"] = asyncio.create_task(_warmup())          # بنسخّن الخطوط والخلفيات من غير ما نعطّل التشغيل
+    app.bot_data["warmup_task"] = asyncio.create_task(_warmup(app))        # بنسخّن الخطوط والخلفيات من غير ما نعطّل التشغيل
+    try:
+        await _set_commands(app)
+    except TelegramError as e:                 # فشل تسجيل قايمة الأوامر مايوقّفش البوت كله
+        log.warning("set_my_commands failed: %s", e)
+
+
+async def _set_commands(app: Application):
     await app.bot.set_my_commands([
         BotCommand("start", "ابدأ معسكر مذاكرة — مثال: /start 2h"),
         BotCommand("stop", "إيقاف المؤقت"),
@@ -1202,6 +1371,30 @@ async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
     log.error("unhandled error while handling update %s", update, exc_info=ctx.error)
 
 
+def _build_requests():
+    """اتصالات تليجرام. الافتراضي في httpx إنه يقفل أي اتصال فاضي بعد 5 ثواني، فأول أمر بعد فترة هدوء كان بيدفع
+    handshake TLS كامل (100-300ms). هنا الاتصالات بتفضل مفتوحة KEEPALIVE ثانية. HTTP/2 اختياري (TG_HTTP2=1)."""
+    import httpx
+    from telegram.request import HTTPXRequest
+
+    version = "1.1"
+    if os.getenv("TG_HTTP2", "0") == "1":
+        try:
+            import h2  # noqa: F401
+            version = "2"
+        except ImportError:
+            log.warning("TG_HTTP2=1 لكن حزمة h2 مش متثبتة (pip install 'httpx[http2]'): هنكمّل بـ HTTP/1.1")
+
+    def limits(n):
+        return httpx.Limits(max_connections=n, max_keepalive_connections=n, keepalive_expiry=TG_KEEPALIVE)
+    req = HTTPXRequest(connection_pool_size=64, pool_timeout=20, connect_timeout=10, read_timeout=20,
+                       write_timeout=30,                   # write_timeout أطول لرفع الصور
+                       http_version=version, httpx_kwargs={"limits": limits(64)})
+    upd_req = HTTPXRequest(connection_pool_size=2, connect_timeout=10, http_version=version,
+                           httpx_kwargs={"limits": limits(2)})
+    return req, upd_req
+
+
 def main():
     if os.getenv("USE_UVLOOP", "0") == "1":              # لوب أسرع بحوالي 2x لو uvloop متثبّت (اختياري)
         try:
@@ -1210,11 +1403,10 @@ def main():
             log.info("uvloop شغال")
         except Exception:
             pass
+    req, upd_req = _build_requests()
     app = (Application.builder().token(TOKEN).post_init(post_init).post_shutdown(post_shutdown)
            .concurrent_updates(32)                         # أمر بطيء (لوحة/شهادة) ميوقّفش باقي الرسايل والأزرار
-           .connection_pool_size(64).pool_timeout(20)      # الافتراضي اتصال HTTP واحد: كل طلبات تليجرام كانت بتتسلسل
-           .get_updates_connection_pool_size(2)
-           .connect_timeout(10).read_timeout(20).write_timeout(30)   # write_timeout أطول لرفع الصور
+           .request(req).get_updates_request(upd_req)
            .build())
     for name, fn in [("start", start_cmd), ("help", help_cmd), ("stop", stop_cmd), ("ready", ready_cmd),
                      ("end", end_cmd), ("me", me_cmd), ("top", top_cmd), ("challenge", challenge_cmd),
@@ -1231,7 +1423,7 @@ def main():
     app.job_queue.run_daily(adhkar_post, time=dtime(ADHKAR_EVENING_HOUR, 0, tzinfo=TZ), data="evening")
     app.job_queue.run_daily(friday_post, time=dtime(10, 0, tzinfo=TZ))
     app.job_queue.run_repeating(prayer_tick, interval=30, first=10)
-    app.run_polling(allowed_updates=["message", "callback_query"])
+    app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=-1)   # -1: يعيد المحاولة لو النت وقع وقت التشغيل
 
 
 if __name__ == "__main__":

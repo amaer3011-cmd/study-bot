@@ -17,7 +17,9 @@ TZ = ZoneInfo(os.getenv("TZ_NAME", "Africa/Cairo"))
 TICK_SECONDS = int(os.getenv("TICK_SECONDS", "10"))                  # كل كام ثانية يتحدث التايمر
 MAX_SESSION_HOURS = int(os.getenv("MAX_SESSION_HOURS", "12"))
 MAX_PAUSE_HOURS = float(os.getenv("MAX_PAUSE_HOURS", "3"))           # موقوفة أكتر من كده = بتتقفل تلقائي
-CONFIRM_END_SECONDS = 6                                              # ضغطتين على زر الإنهاء خلال المدة دي = تأكيد
+DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "20"))                    # اتصالات الداتابيز (الأوامر بتشتغل بالتوازي)
+TG_KEEPALIVE = float(os.getenv("TG_KEEPALIVE", "120"))               # ثواني بقاء اتصال تليجرام مفتوح وهو فاضي
+CONFIRM_END_SECONDS = 6                                            # ضغطتين على زر الإنهاء خلال المدة دي = تأكيد
 
 # ── البومودورو (حدود اللي الأدمن يقدر يضبطه بـ /pomodoro) ──
 POMO_MIN_STUDY = 5 * 60            # أقل فترة مذاكرة
