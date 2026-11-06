@@ -1,6 +1,7 @@
 python-telegram-bot[job-queue]==21.6
 asyncpg>=0.29,<1
-SQLAlchemy[asyncio]>=2.0,<3
+SQLAlchemy>=2.0,<3
+greenlet>=3.0,<4
 Pillow>=10.3
 # محرك رسم العربي في الشهادة واللوحة: حزم pip جاهزة (مفيش apt ولا libraqm)
 uharfbuzz>=0.39
