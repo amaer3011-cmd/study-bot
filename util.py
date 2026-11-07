@@ -2,7 +2,7 @@
 """دوال مساعدة نقية (من غير تليجرام ولا داتابيز): وقت، تنسيق، تحليل المدة."""
 import math
 import re
-from datetime import datetime, time as dtime, timedelta, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
 from html import escape
 
 from config import TZ
@@ -127,6 +127,32 @@ def calc_streak(days: list, today_date) -> int:
         n += 1
         d -= timedelta(days=1)
     return n
+
+def split_by_day(start: datetime, secs: float, tz=TZ) -> dict[date, float]:
+    """يقسّم فترة (بداية + ثواني) على الأيام المحلية: {يوم: ثواني}. الحساب بالـ UTC عشان تغيير التوقيت الصيفي."""
+    out: dict[date, float] = {}
+    cur, left = start.astimezone(tz), float(secs)
+    while left > 1e-6:
+        nxt = datetime.combine(cur.date() + timedelta(days=1), dtime.min, tz)
+        span = (nxt.astimezone(timezone.utc) - cur.astimezone(timezone.utc)).total_seconds()
+        take = min(span, left)
+        out[cur.date()] = out.get(cur.date(), 0.0) + take
+        left -= take
+        cur = nxt
+    return out
+
+def day_breakdown(segments: list, eff_at_join: float, duration: float, tz=TZ) -> dict[date, float]:
+    """segments = [(وقت_البداية, ثواني)] بالترتيب (فترات التشغيل الفعلي). بترجّع مذاكرة المشارك لكل يوم،
+    من لحظة انضمامه (eff_at_join) لحد نهاية المعسكر (duration)."""
+    out: dict[date, float] = {}
+    done = 0.0
+    for start, secs in segments:
+        a, b = max(done, eff_at_join or 0.0), min(done + secs, duration)
+        if b > a:
+            for d, v in split_by_day(start + timedelta(seconds=a - done), b - a, tz).items():
+                out[d] = out.get(d, 0.0) + v
+        done += secs
+    return out
 
 def _chunk_lines(lines: list[str], limit: int = 3800) -> list[str]:
     """يقسّم قايمة سطور لرسائل كل واحدة أقل من limit حرف."""

@@ -12,34 +12,38 @@ import random
 import re
 import time
 import urllib.request
-from datetime import datetime, time as dtime, timedelta
+from datetime import date, datetime, time as dtime, timedelta
 from html import escape
 
 import asyncpg
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.constants import ChatType, ParseMode, ReactionEmoji
 from telegram.error import BadRequest, ChatMigrated, Forbidden, RetryAfter, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
+import admin
 import art
 import certificate
+import islamic
 import leaderboard
 import textengine
 import timercard
 from adhkar import caption as adhkar_caption
 from config import (ADHKAR_EVENING_HOUR, ADHKAR_MORNING_HOUR, ASSETS, BOARD_CACHE_SECONDS, BROADCAST_CONCURRENCY,
                     CHALLENGE_ADMINS_ONLY, CHALLENGE_DAILY_HOUR, CONFIRM_END_SECONDS, DAILY_CLOSING, DATABASE_URL,
-                    DB_POOL_MAX, TG_KEEPALIVE,
-                    LEADERBOARD_HOUR, MAX_PAUSE_HOURS, MAX_SESSION_HOURS, POMO_MAX_BREAK, POMO_MIN_BREAK, POMO_MIN_STUDY,
-                    PRAYER_CITY, PRAYER_COUNTRY, TICK_SECONDS,
-                    TOKEN, TZ, log)
+                    FASTING_REMIND_HOUR, HIJRI_OFFSET, LEADERBOARD_HOUR, MAX_PAUSE_HOURS, MAX_SESSION_HOURS,
+                    POMO_MAX_BREAK, POMO_MIN_BREAK, POMO_MIN_STUDY, PRAYER_BUTTON_WINDOW_MIN, PRAYER_CITY,
+                    PRAYER_COUNTRY, PRAYER_PAUSE_MAX, PRAYER_PAUSE_MIN, RAMADAN_SUHOOR_MIN, RAMADAN_TARAWEEH_MIN,
+                    TICK_SECONDS, TOKEN, TZ, log)
 from duas import CATEGORIES, DUA_ITEMS, pick as pick_dua
-from db import (SCHEMA, ROSTER_NAMES, board, get_challenge, get_challenge_row, get_pomodoro, recent_chats,  # noqa: F401
-                rosters, set_pomodoro, user_streak)
+from db import (SCHEMA, ROSTER_NAMES, backfill_study_days, board, fire_once, get_challenge, get_challenge_row,  # noqa: F401
+                get_pomodoro, is_participant, log_segment, recent_chats, rosters, running_session_ids,
+                save_study_days, set_pomodoro, user_streak)
 from ui import (AFTER_DUAS, DUAS, POMODORO_HELP, WELCOME, break_caption, challenge_blurb, challenge_progress,  # noqa: F401
-                finish_lines, level_of, me_text, pomodoro_status, session_keyboard, session_text, study_back_caption,
+                finish_lines, level_of, me_text, pomodoro_status, pray_resumed_text, pray_started_text,
+                prayer_keyboard, PRAYER_HINT, session_keyboard, session_text, study_back_caption,
                 top_caption, top_keyboard)
-from util import (SEP, _AR_DIGITS, _chunk_lines, ar_duration, bar, calc_streak, day_start, eff_elapsed,  # noqa: F401
+from util import (SEP, _AR_DIGITS, _chunk_lines, ar_duration, bar, calc_streak, day_breakdown, day_start, eff_elapsed,  # noqa: F401
                   fmt_clock, fmt_short, fmt_time, mention, next_break_at, now_utc, parse_duration, today)
 
 if textengine.available():
@@ -53,6 +57,15 @@ def pool_of(ctx) -> asyncpg.Pool:
 
 
 ADMIN_TTL = 60
+
+
+async def is_admin_msg(ctx, update) -> bool:
+    """أدمن عادي، أو أدمن مجهول (Anonymous Admin): رسالته بتيجي باسم الجروب نفسه (sender_chat.id == chat.id)."""
+    chat, user = update.effective_chat, update.effective_user
+    sc = getattr(update.effective_message, "sender_chat", None)
+    if sc is not None and sc.id == chat.id:
+        return True
+    return await is_admin(ctx, chat.id, user.id)
 
 
 async def is_admin(ctx, chat_id: int, user_id: int) -> bool:
@@ -76,21 +89,6 @@ def thread_kwargs(msg) -> dict:
     return {"message_thread_id": msg.message_thread_id} if msg and msg.is_topic_message else {}
 
 
-def anon_admin(msg, chat) -> bool:
-    """أدمن بيكتب كـ «الجروب نفسه» (anonymous admin): تليجرام بيبعت id بوت وهمي، فـ get_chat_member مش هينفع."""
-    sc = getattr(msg, "sender_chat", None)
-    return bool(sc is not None and getattr(sc, "id", None) == chat.id)
-
-
-def spawn(ctx, coro) -> asyncio.Task:
-    """يشغّل coroutine في الخلفية من غير ما نستناها، ومع الاحتفاظ بمرجع للـ task (عشان مايتمسحش من الذاكرة)."""
-    tasks = ctx.application.bot_data.setdefault("bg_tasks", set())
-    t = asyncio.ensure_future(coro)
-    tasks.add(t)
-    t.add_done_callback(tasks.discard)
-    return t
-
-
 # ───────────── رسالة المعسكر وتحديثها ─────────────
 _GONE_MARKERS = ("message to edit not found", "message_id_invalid", "message can't be edited")
 
@@ -112,7 +110,8 @@ async def refresh(ctx, s: dict, force: bool = False, roster: tuple[int, list[str
     try:
         await ctx.bot.edit_message_text(
             text, chat_id=s["chat_id"], message_id=s["message_id"], parse_mode=ParseMode.HTML,
-            reply_markup=None if s["status"] == "done" else session_keyboard(s["id"], s["status"], bool(s.get("break_until"))))
+            reply_markup=None if s["status"] == "done" else session_keyboard(
+                s["id"], s["status"], bool(s.get("break_until")), bool(s.get("prayer_until"))))
         cache[s["id"]] = text
     except RetryAfter as e:
         bd["flood_until"] = time.monotonic() + float(e.retry_after) + 1   # كل الجلسات تستنى بدل ما نكمّل نضرب في الحد
@@ -127,17 +126,16 @@ async def refresh(ctx, s: dict, force: bool = False, roster: tuple[int, list[str
             await _repost_session_message(ctx, s, text)       # حد مسح رسالة المعسكر: نبعتها من جديد
         else:
             log.warning("edit failed (session %s): %s", s["id"], e)
-            await _mark_dead(ctx, s["chat_id"], e)            # اتطرد/الجروب اتمسح: نبطّل رسائل الجدولة ليه
     except TelegramError as e:
         log.warning("edit error (session %s): %s", s["id"], e)
-        await _mark_dead(ctx, s["chat_id"], e)
 
 
 async def _repost_session_message(ctx, s: dict, text: str):
     kw = {"message_thread_id": s["thread_id"]} if s.get("thread_id") else {}
     try:
         sent = await ctx.bot.send_message(s["chat_id"], text, parse_mode=ParseMode.HTML,
-                                          reply_markup=session_keyboard(s["id"], s["status"], bool(s.get("break_until"))), **kw)
+                                          reply_markup=session_keyboard(s["id"], s["status"], bool(s.get("break_until")),
+                                                                         bool(s.get("prayer_until"))), **kw)
     except TelegramError as e:
         log.warning("repost session message failed (session %s): %s", s["id"], e)
         await _mark_dead(ctx, s["chat_id"], e)
@@ -159,6 +157,7 @@ async def _handle_migration(ctx, old_id: int, new_id: int):
                             old_id, new_id)
             await c.execute("UPDATE chat_settings SET chat_id=$2 WHERE chat_id=$1 "
                             "AND NOT EXISTS (SELECT 1 FROM chat_settings x WHERE x.chat_id=$2)", old_id, new_id)
+            await c.execute("UPDATE study_days SET chat_id=$2 WHERE chat_id=$1", old_id, new_id)
             await c.execute("UPDATE awards SET chat_id=$2 WHERE chat_id=$1 "
                             "AND NOT EXISTS (SELECT 1 FROM awards x WHERE x.chat_id=$2 AND x.day=awards.day "
                             "AND x.user_id=awards.user_id)", old_id, new_id)
@@ -166,64 +165,13 @@ async def _handle_migration(ctx, old_id: int, new_id: int):
 
 
 # ───────────── دورة الحياة ─────────────
-def _seconds_to_event(s: dict, now: datetime) -> float | None:
-    """كام ثانية فاضلة لأقرب حدث (نهاية المعسكر / بداية الراحة / نهاية الراحة)، أو None لو مفيش حدث جاي."""
-    if s["status"] == "running":
-        nb = next_break_at(s)
-        target = min(s["duration"], nb) if nb is not None else s["duration"]
-        return target - eff_elapsed(s, now)
-    if s["status"] == "paused" and s.get("break_until"):
-        return (s["break_until"] - now).total_seconds()
-    return None
-
-
-async def _process_due(ctx, sid: int):
-    """بينفّذ الحدث المستحق (إنهاء/راحة/رجوع) على أحدث نسخة من الجلسة من الداتابيز."""
-    async with pool_of(ctx).acquire() as c:
-        r = await c.fetchrow("SELECT * FROM sessions WHERE id=$1", sid)
-    if not r or r["status"] == "done":
-        return
-    s, now = dict(r), now_utc()
-    if s["status"] == "running":
-        e = eff_elapsed(s, now)
-        if e >= s["duration"]:
-            await finish_session(ctx, s, defer_awards=True)
-        else:
-            nb = next_break_at(s)
-            if nb is not None and e >= nb:
-                await start_break(ctx, s, e)
-    elif s["status"] == "paused" and s.get("break_until") and now >= s["break_until"]:
-        await end_break(ctx, s)
-
-
-def _arm_due(ctx, s: dict, delay: float):
-    """المؤقت الدوري بيتحدّث كل TICK_SECONDS، فالنهاية كانت بتتأخر لحد 10 ثواني. هنا بنضبط منبّه دقيق للحدث
-    الجاي (لو قريب) فينفّذ في ثانيته بالظبط. لو الجلسة اتوقفت/اتغيرت قبله، _process_due مابيعملش حاجة."""
-    armed = ctx.application.bot_data.setdefault("armed", {})
-    old = armed.get(s["id"])
-    if old is not None and not old.done():
-        return
-
-    async def run():
-        try:
-            await asyncio.sleep(max(0.0, delay) + 0.05)
-            await _process_due(ctx, s["id"])
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("armed event failed for session %s", s["id"])
-        finally:
-            armed.pop(s["id"], None)
-    armed[s["id"]] = spawn(ctx, run())
-
-
 async def _tick_one(ctx, s: dict, roster: tuple[int, list[str]], sem: asyncio.Semaphore):
     async with sem:
         try:
             now = now_utc()
             e = eff_elapsed(s, now) if s["status"] == "running" else 0
             if s["status"] == "running" and e >= s["duration"]:
-                await finish_session(ctx, s, defer_awards=True)
+                await finish_session(ctx, s)
             elif s["status"] == "running":
                 nb = next_break_at(s)
                 if nb is not None and e >= nb:
@@ -235,11 +183,13 @@ async def _tick_one(ctx, s: dict, roster: tuple[int, list[str]], sem: asyncio.Se
                     await end_break(ctx, s)
                 else:
                     await refresh(ctx, s, roster=roster)          # عدّاد الراحة
+            elif s["status"] == "paused" and s.get("prayer_until"):
+                if now >= s["prayer_until"]:
+                    await end_prayer(ctx, s)
+                else:
+                    await refresh(ctx, s, roster=roster)          # عدّاد وقفة الصلاة
             elif s["status"] == "paused":
                 await _check_stale_pause(ctx, s, now)
-            left = _seconds_to_event(s, now)
-            if left is not None and 0 < left <= TICK_SECONDS + 1:
-                _arm_due(ctx, s, left)
         except Exception:
             log.exception("tick failed for session %s", s["id"])
 
@@ -253,7 +203,7 @@ async def _check_stale_pause(ctx, s: dict, now: datetime):
         return
     if (now - s["paused_at"]).total_seconds() < MAX_PAUSE_HOURS * 3600:
         return
-    row = await end_early(ctx, s, defer_awards=True)
+    row = await end_early(ctx, s)
     if row:
         kw = {"message_thread_id": s["thread_id"]} if s["thread_id"] else {}
         try:
@@ -301,11 +251,17 @@ async def start_break(ctx, s: dict, eff: float):
     brk = int(s["pomo_break"])
     done = max(s["breaks_done"] + 1, int(eff // s["pomo_study"]))      # لو البوت كان واقف: نعدّي الراحات الفايتة
     async with pool_of(ctx).acquire() as c:
-        row = await c.fetchrow(
-            "UPDATE sessions SET base_eff=LEAST(duration, $3::float8), run_started=NULL, status='paused', "
-            "paused_at=now(), break_until=now() + make_interval(secs => $4::int), breaks_done=$5 "
-            "WHERE id=$1 AND status='running' AND breaks_done=$2 RETURNING *",
-            s["id"], s["breaks_done"], float(eff), brk, done)
+        async with c.transaction():
+            old = await c.fetchrow(
+                "SELECT run_started, base_eff FROM sessions WHERE id=$1 AND status='running' AND breaks_done=$2 "
+                "FOR UPDATE", s["id"], s["breaks_done"])
+            row = None
+            if old:
+                row = await c.fetchrow(
+                    "UPDATE sessions SET base_eff=LEAST(duration, $2::float8), run_started=NULL, status='paused', "
+                    "paused_at=now(), break_until=now() + make_interval(secs => $3::int), breaks_done=$4 "
+                    "WHERE id=$1 RETURNING *", s["id"], float(eff), brk, done)
+                await log_segment(c, s["id"], old["run_started"], row["base_eff"] - old["base_eff"])
     if not row:
         return          # حد وقّف/خلّص الجلسة في نفس اللحظة
     s = dict(row)
@@ -329,14 +285,32 @@ async def end_break(ctx, s: dict):
     await send_timer_card(ctx, s, "study", block, f"الفترة {n}", study_back_caption(block, n))
 
 
-async def end_early(ctx, s: dict, defer_awards: bool = False):
+async def end_prayer(ctx, s: dict):
+    """وقفة الصلاة خلصت: نكمّل العدّاد تلقائي ونبلّغ الجروب."""
+    async with pool_of(ctx).acquire() as c:
+        row = await c.fetchrow(
+            "UPDATE sessions SET run_started=now(), status='running', paused_at=NULL, prayer_until=NULL "
+            "WHERE id=$1 AND status='paused' AND prayer_until IS NOT NULL RETURNING *", s["id"])
+    if not row:
+        return          # اتستأنف يدويًا
+    s = dict(row)
+    await refresh(ctx, s, force=True)
+    kw = {"message_thread_id": s["thread_id"]} if s.get("thread_id") else {}
+    try:
+        await ctx.bot.send_message(s["chat_id"], pray_resumed_text(), **kw)
+    except TelegramError as e:
+        log.warning("prayer resume notice failed: %s", e)
+        await _mark_dead(ctx, s["chat_id"], e)
+
+
+async def end_early(ctx, s: dict):
     """إنهاء المعسكر فورًا؛ المدة المحسوبة = الوقت اللي فعلاً اتذاكر. بترجّع الصف لو الإنهاء تم."""
     elapsed = max(60, int(round(eff_elapsed(s, now_utc()))))
     async with pool_of(ctx).acquire() as c:
         row = await c.fetchrow("UPDATE sessions SET duration=$2 WHERE id=$1 AND status <> 'done' RETURNING *",
                                s["id"], min(elapsed, s["duration"]))
     if row:
-        await finish_session(ctx, dict(row), defer_awards=defer_awards)
+        await finish_session(ctx, dict(row))
     return row
 
 
@@ -357,29 +331,51 @@ async def _mark_dead(ctx, chat_id: int, err: Exception):
         log.info("chat %s marked dead: %s", chat_id, err)
 
 
-async def _award_safe(ctx, chat_id: int, thread_id: int | None):
-    try:
-        await award_check(ctx, chat_id, thread_id)
-    except Exception:
-        log.exception("award check failed for chat %s", chat_id)
+def _study_day_rows(fresh: dict, parts, segs) -> list[tuple[int, object, int]]:
+    """مذاكرة كل مشارك موزّعة على الأيام (بتوقيت TZ_NAME). المجموع دايمًا = studied بالظبط."""
+    ended_day = fresh["ended_at"].astimezone(TZ).date()
+    seg_list = [(r["start_at"], r["secs"]) for r in segs]
+    rows = []
+    for p in parts:
+        studied = int(p["studied"] or 0)
+        if studied <= 0:
+            continue
+        dd = day_breakdown(seg_list, p["eff_at_join"], fresh["duration"])
+        total = sum(dd.values())
+        if total > studied:
+            dd = {d: v * studied / total for d, v in dd.items()}
+        elif total < studied:           # معسكرات اتسجلت قبل ما نسجّل الفترات: الباقي على يوم الانتهاء
+            dd[ended_day] = dd.get(ended_day, 0.0) + (studied - total)
+        ints = {d: int(round(v)) for d, v in dd.items() if v >= 0.5}
+        if not ints:
+            ints = {ended_day: studied}
+        ints[max(ints, key=ints.get)] += studied - sum(ints.values())      # فرق التقريب
+        rows.extend((p["user_id"], d, v) for d, v in sorted(ints.items()) if v > 0)
+    return rows
 
 
-async def finish_session(ctx, s: dict, defer_awards: bool = False):
-    """defer_awards=True (من التايمر): الشهادات بتتولّد وتتبعت في الخلفية عشان تيك باقي الجلسات مايتأخرش."""
+async def finish_session(ctx, s: dict):
     pool = pool_of(ctx)
     async with pool.acquire() as c:
         async with c.transaction():
-            claimed = await c.fetchval(
-                "UPDATE sessions SET status='done', ended_at=now(), base_eff=duration, run_started=NULL "
-                "WHERE id=$1 AND status <> 'done' RETURNING id", s["id"])
-            if not claimed:
+            old = await c.fetchrow(
+                "SELECT status, run_started, base_eff, duration FROM sessions WHERE id=$1 FOR UPDATE", s["id"])
+            if not old or old["status"] == "done":
                 return  # حد تاني خلّصها
+            await c.execute(
+                "UPDATE sessions SET status='done', ended_at=now(), base_eff=duration, run_started=NULL WHERE id=$1",
+                s["id"])
+            if old["status"] == "running":      # آخر فترة تشغيل لحد ما المعسكر يخلص
+                await log_segment(c, s["id"], old["run_started"], old["duration"] - old["base_eff"])
             await c.execute(
                 "UPDATE participants SET studied = COALESCE(studied,0) + ROUND(GREATEST(0, $2::float8 - eff_at_join))::int "
                 "WHERE session_id=$1", s["id"], float(s["duration"]))
             parts = await c.fetch(
                 "SELECT * FROM participants WHERE session_id=$1 ORDER BY user_id", s["id"])
             fresh = dict(await c.fetchrow("SELECT * FROM sessions WHERE id=$1", s["id"]))
+            segs = await c.fetch("SELECT start_at, secs FROM session_segments WHERE session_id=$1 ORDER BY start_at",
+                                 s["id"])
+            await save_study_days(c, s["id"], s["chat_id"], _study_day_rows(fresh, parts, segs))
 
     await refresh(ctx, fresh, force=True)
     ctx.application.bot_data.get("last_text", {}).pop(s["id"], None)
@@ -394,10 +390,7 @@ async def finish_session(ctx, s: dict, defer_awards: bool = False):
             await _mark_dead(ctx, s["chat_id"], e)
             break
 
-    if defer_awards:
-        spawn(ctx, _award_safe(ctx, s["chat_id"], s["thread_id"]))
-    else:
-        await award_check(ctx, s["chat_id"], s["thread_id"])
+    await award_check(ctx, s["chat_id"], s["thread_id"])
 
 
 # ───────────── الأوامر ─────────────
@@ -425,8 +418,9 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if dur is None:
         await msg.reply_html("مش فاهم المدة 🤔 جرّب: <code>/start 2h</code> أو <code>/start 45m فيزياء</code> أو <code>/start 1h30m</code>")
         return
-    if dur < 60 or dur > MAX_SESSION_HOURS * 3600:
-        await msg.reply_html(f"المدة لازم تكون من دقيقة لحد {MAX_SESSION_HOURS} ساعة.")
+    max_h = admin.num(ctx, "max_session_hours", MAX_SESSION_HOURS)
+    if dur < 60 or dur > max_h * 3600:
+        await msg.reply_html(f"المدة لازم تكون من دقيقة لحد {max_h} ساعة.")
         return
 
     pool = pool_of(ctx)
@@ -434,21 +428,20 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pomo = await get_pomodoro(c, chat.id)
         try:
             async with c.transaction():
-                row = await c.fetchrow(        # RETURNING * بدل SELECT تاني: رحلة أقل للداتابيز
+                sid = await c.fetchval(
                     "INSERT INTO sessions(chat_id, thread_id, creator_id, duration, run_started, dua_idx, subject, "
-                    "pomo_study, pomo_break) VALUES($1,$2,$3,$4,now(),$5,$6,$7,$8) RETURNING *",
+                    "pomo_study, pomo_break) VALUES($1,$2,$3,$4,now(),$5,$6,$7,$8) RETURNING id",
                     chat.id, msg.message_thread_id if msg.is_topic_message else None,
                     user.id, dur, random.randrange(len(DUAS)), subject,
                     pomo[0] if pomo else None, pomo[1] if pomo else None)
-                sid = row["id"]
                 await c.execute(
                     "INSERT INTO participants(session_id,user_id,username,full_name) VALUES($1,$2,$3,$4)",
                     sid, user.id, user.username, user.full_name)
-                await c.execute("DELETE FROM dead_chats WHERE chat_id=$1", chat.id)   # البوت رجع يشتغل في الجروب
         except asyncpg.UniqueViolationError:
             await msg.reply_html("فيه معسكر شغال بالفعل في الجروب، اضغط <b>انضمام</b> على رسالته 👆")
             return
-        s = dict(row)
+        await c.execute("DELETE FROM dead_chats WHERE chat_id=$1", chat.id)   # البوت رجع يشتغل في الجروب
+        s = dict(await c.fetchrow("SELECT * FROM sessions WHERE id=$1", sid))
 
     sub = f"مدة المعسكر: {ar_duration(dur)}"
     if s.get("pomo_study") and next_break_at(s) is not None:
@@ -459,16 +452,14 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sent = await ctx.bot.send_message(
             chat.id, text, parse_mode=ParseMode.HTML, reply_markup=session_keyboard(sid), **thread_kwargs(msg))
     except TelegramError as e:
-        # لو الرسالة ماتبعتتش (البوت مالوش صلاحية كتابة مثلًا) الجلسة كانت بتفضل «شغالة» من غير رسالة وتمنع أي /start جديد
-        log.warning("session message failed (session %s): %s", sid, e)
+        # من غير الرسالة مفيش message_id ولا أزرار: نلغي المعسكر بدل ما يفضل شبح يمنع أي /start جديد
+        log.warning("start: session message failed (chat %s): %s", chat.id, e)
         async with pool.acquire() as c:
             await c.execute("DELETE FROM sessions WHERE id=$1", sid)
         if isinstance(e, ChatMigrated):
             await _handle_migration(ctx, chat.id, e.new_chat_id)
-        else:
-            await _mark_dead(ctx, chat.id, e)
         try:
-            await msg.reply_text("ماقدرتش أبعت رسالة المعسكر 😕 اتأكد إن عندي صلاحية الكتابة في الجروب وجرّب /start تاني.")
+            await msg.reply_text("معرفتش أبعت رسالة المعسكر هنا 😕 اتأكد إن البوت عنده صلاحية الإرسال (وفي التوبيك ده كمان) وجرّب /start تاني.")
         except TelegramError:
             pass
         return
@@ -493,29 +484,37 @@ async def _controllable(update, ctx):
     if not s:
         await msg.reply_text("مفيش معسكر شغال دلوقتي. ابدأ واحد بـ /start 2h")
         return None
-    if user.id != s["creator_id"] and not anon_admin(msg, chat) and not await is_admin(ctx, chat.id, user.id):
+    if user.id != s["creator_id"] and not await is_admin_msg(ctx, update):
         await msg.reply_text("بس اللي بدأ المعسكر أو الأدمن يقدر يتحكم فيه.")
         return None
     return s
 
 
-async def pause_session(ctx, s: dict, do_refresh: bool = True):
-    """بترجّع الصف لو الإيقاف تم (مش لو كانت موقوفة أصلًا). do_refresh=False: المنادي هيحدّث الرسالة بنفسه بعد ما يرد على الزر."""
+async def pause_session(ctx, s: dict, prayer_secs: int | None = None):
+    """بترجّع الصف لو الإيقاف تم (مش لو كانت موقوفة أصلًا). prayer_secs = وقفة صلاة بترجع تلقائي بعد المدة دي."""
     async with pool_of(ctx).acquire() as c:
-        row = await c.fetchrow(
-            "UPDATE sessions SET base_eff = LEAST(duration, base_eff + EXTRACT(EPOCH FROM (now() - run_started))), "
-            "run_started=NULL, status='paused', paused_at=now() WHERE id=$1 AND status='running' RETURNING *", s["id"])
-    if row and do_refresh:
+        async with c.transaction():
+            old = await c.fetchrow(
+                "SELECT run_started, base_eff FROM sessions WHERE id=$1 AND status='running' FOR UPDATE", s["id"])
+            row = None
+            if old:
+                row = await c.fetchrow(
+                    "UPDATE sessions SET base_eff = LEAST(duration, base_eff + EXTRACT(EPOCH FROM (now() - run_started))), "
+                    "run_started=NULL, status='paused', paused_at=now(), "
+                    "prayer_until = CASE WHEN $2::int IS NULL THEN NULL ELSE now() + make_interval(secs => $2::int) END "
+                    "WHERE id=$1 RETURNING *", s["id"], prayer_secs)
+                await log_segment(c, s["id"], old["run_started"], row["base_eff"] - old["base_eff"])
+    if row:
         await refresh(ctx, dict(row), force=True)
     return row
 
 
-async def resume_session(ctx, s: dict, do_refresh: bool = True):
+async def resume_session(ctx, s: dict):
     async with pool_of(ctx).acquire() as c:
         row = await c.fetchrow(
-            "UPDATE sessions SET run_started=now(), status='running', paused_at=NULL, break_until=NULL "
-            "WHERE id=$1 AND status='paused' RETURNING *", s["id"])
-    if row and do_refresh:
+            "UPDATE sessions SET run_started=now(), status='running', paused_at=NULL, break_until=NULL, "
+            "prayer_until=NULL WHERE id=$1 AND status='paused' RETURNING *", s["id"])
+    if row:
         await refresh(ctx, dict(row), force=True)
     return row
 
@@ -526,6 +525,8 @@ async def stop_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if s["status"] == "paused" and s.get("break_until"):
         await update.effective_message.reply_text("☕ إحنا في الراحة دلوقتي وهنرجع تلقائي. لو عايز تكمّل فورًا: /ready")
+    elif s["status"] == "paused" and s.get("prayer_until"):
+        await update.effective_message.reply_text("🕌 المؤقت واقف للصلاة وهيكمّل تلقائي. للاستئناف فورًا: /ready")
     elif s["status"] == "paused":
         await update.effective_message.reply_text("المؤقت متوقف بالفعل. للاستئناف: /ready")
     elif await pause_session(ctx, s):
@@ -540,6 +541,87 @@ async def ready_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("المؤقت شغال بالفعل ▶️")
     elif await resume_session(ctx, s):
         await update.effective_message.reply_text("▶️ تم استئناف المؤقت. تقبّل الله منا ومنكم 🤍")
+
+
+# ───────────── وقف المعسكر للصلاة ─────────────
+async def _try_pray_pause(ctx, s: dict, user_id: int, admin_check, minutes: int) -> tuple[bool, str]:
+    """(نجح؟، رسالة). مسموح لصاحب المعسكر أو أي مشارك أو الأدمن."""
+    if s["status"] == "paused":
+        if s.get("prayer_until"):
+            return False, "🕌 المؤقت واقف للصلاة بالفعل"
+        if s.get("break_until"):
+            return False, "☕ إحنا في الراحة دلوقتي، صلّوا براحتكم 🤍"
+        return False, "المؤقت متوقف بالفعل"
+    if user_id != s["creator_id"]:
+        async with pool_of(ctx).acquire() as c:
+            member = await is_participant(c, s["id"], user_id)
+        if not member and not await admin_check():
+            return False, "وقف الصلاة للمشاركين في المعسكر أو الأدمن 🔒"
+    if not await pause_session(ctx, s, prayer_secs=minutes * 60):
+        return False, "المؤقت متوقف بالفعل"
+    return True, pray_started_text(minutes)
+
+
+async def pray_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/pray [دقايق]: يوقف المعسكر للصلاة ويكمّل تلقائي (الافتراضي PRAYER_PAUSE_MIN دقيقة)."""
+    chat, user, msg = update.effective_chat, update.effective_user, update.effective_message
+    if chat.type == ChatType.PRIVATE:
+        await msg.reply_text("الأمر ده بيشتغل جوه الجروب بس.")
+        return
+    s = await _active_session(ctx, chat.id)
+    if not s:
+        await msg.reply_text("مفيش معسكر شغال دلوقتي. ابدأ واحد بـ /start 2h")
+        return
+    minutes = admin.num(ctx, "prayer_pause_min", PRAYER_PAUSE_MIN)
+    if ctx.args:
+        arg = ctx.args[0].translate(_AR_DIGITS)
+        if not arg.isdigit() or not 5 <= int(arg) <= PRAYER_PAUSE_MAX:
+            await msg.reply_html(f"اكتب عدد الدقايق من 5 لـ {PRAYER_PAUSE_MAX}، مثال: <code>/pray 20</code>")
+            return
+        minutes = int(arg)
+    _, text = await _try_pray_pause(ctx, s, user.id, lambda: is_admin_msg(ctx, update), minutes)
+    await msg.reply_html(text, **thread_kwargs(msg))
+
+
+def _prayer_window_open(times: dict, key: str, nowl: datetime) -> bool:
+    """زرار الصلاة بيشتغل من الأذان لحد PRAYER_BUTTON_WINDOW_MIN دقيقة بعده (عشان زرار قديم مايوقفش معسكر بالغلط)."""
+    if not times.get(key):
+        return False
+    due = _due_at(times, key, nowl)
+    return due <= nowl < due + timedelta(minutes=PRAYER_BUTTON_WINDOW_MIN)
+
+
+async def pray_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q, user = update.callback_query, update.callback_query.from_user
+    try:
+        _, sid, key = q.data.split(":")
+        sid = int(sid)
+    except ValueError:
+        await _answer(q)
+        return
+    if key not in dict(PRAYERS):
+        await _answer(q)
+        return
+    if not _prayer_window_open(await _prayer_times(ctx), key, datetime.now(TZ)):
+        await _answer(q, "الزرار ده خلص وقته. تقدر تستخدم /pray في أي وقت 🤍", True)
+        return
+    async with pool_of(ctx).acquire() as c:
+        r = await c.fetchrow("SELECT * FROM sessions WHERE id=$1", sid)
+    if not r or r["status"] == "done":
+        await _answer(q, "المعسكر ده خلص ✅", True)
+        return
+    s = dict(r)
+    ok, text = await _try_pray_pause(ctx, s, user.id, lambda: is_admin(ctx, s["chat_id"], user.id),
+                                    admin.num(ctx, "prayer_pause_min", PRAYER_PAUSE_MIN))
+    if not ok:
+        await _answer(q, text, True)
+        return
+    await _answer(q, "🕌 تم إيقاف المؤقت للصلاة، تقبّل الله منكم")
+    kw = {"message_thread_id": s["thread_id"]} if s.get("thread_id") else {}
+    try:
+        await ctx.bot.send_message(s["chat_id"], text, parse_mode=ParseMode.HTML, **kw)
+    except TelegramError as e:
+        log.warning("prayer pause notice failed: %s", e)
 
 
 async def end_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -564,16 +646,10 @@ async def _control_button(update, ctx, action: str, sid: int, s: dict):
         await _answer(q, "بس اللي بدأ المعسكر أو الأدمن يقدر يتحكم فيه 🔒", True)
         return
     if action == "pause":
-        row = await pause_session(ctx, s, do_refresh=False)       # نرد على الضغطة الأول (فورًا) وبعدين نحدّث الرسالة
-        await _answer(q, "⏸ تم الإيقاف" if row
+        await _answer(q, "⏸ تم الإيقاف" if await pause_session(ctx, s)
                       else ("☕ إحنا في الراحة دلوقتي" if s.get("break_until") else "المؤقت متوقف بالفعل"))
-        if row:
-            await refresh(ctx, dict(row), force=True)
     elif action == "resume":
-        row = await resume_session(ctx, s, do_refresh=False)
-        await _answer(q, "▶️ تم الاستئناف" if row else "المؤقت شغال بالفعل")
-        if row:
-            await refresh(ctx, dict(row), force=True)
+        await _answer(q, "▶️ تم الاستئناف" if await resume_session(ctx, s) else "المؤقت شغال بالفعل")
     else:  # end
         pend = ctx.application.bot_data.setdefault("end_confirm", {})
         key, now = (sid, user.id), time.monotonic()
@@ -587,34 +663,6 @@ async def _control_button(update, ctx, action: str, sid: int, s: dict):
                 pend.clear()
                 pend[key] = now
             await _answer(q, "اضغط ⏹ إنهاء مرة تانية للتأكيد", True)
-
-
-JOIN_REFRESH_DELAY = 0.8
-
-
-def _schedule_refresh(ctx, sid: int, delay: float = JOIN_REFRESH_DELAY):
-    """100 طالب بيضغطوا «انضمام» في نفس اللحظة = 100 تعديل لنفس الرسالة = flood control من تليجرام.
-    هنا كل الضغطات اللي في نافذة صغيرة بتتجمّع في تعديل واحد."""
-    pending = ctx.application.bot_data.setdefault("refresh_pending", set())
-    if sid in pending:
-        return
-    pending.add(sid)
-
-    async def run():
-        try:
-            await asyncio.sleep(delay)
-            pending.discard(sid)               # أي انضمام بعد كده هيجدول تعديل جديد
-            async with pool_of(ctx).acquire() as c:
-                r = await c.fetchrow("SELECT * FROM sessions WHERE id=$1", sid)
-            if r and r["status"] != "done":
-                await refresh(ctx, dict(r), force=True)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("scheduled refresh failed for session %s", sid)
-        finally:
-            pending.discard(sid)
-    spawn(ctx, run())
 
 
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -645,7 +693,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await _answer(q, answer, alert)
     if changed:
-        _schedule_refresh(ctx, sid)
+        await refresh(ctx, s, force=True)
 
 
 # ───────────── ضبط البومودورو ورد القلب ─────────────
@@ -675,7 +723,7 @@ async def pomodoro_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             cfg = await get_pomodoro(c, chat.id)
         await msg.reply_html(f"{pomodoro_status(cfg)}\n\n{POMODORO_HELP}")
         return
-    if not anon_admin(msg, chat) and not await is_admin(ctx, chat.id, user.id):
+    if not await is_admin_msg(ctx, update):
         await msg.reply_text("ضبط البومودورو للأدمن بس 🔒")
         return
     if ctx.args[0].lower() in ("off", "stop", "0", "إيقاف", "ايقاف", "وقف", "تعطيل", "الغاء", "إلغاء"):
@@ -688,8 +736,9 @@ async def pomodoro_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_html("مش فاهم الأرقام 🤔\n\n" + POMODORO_HELP)
         return
     study, brk = parsed
-    if study < POMO_MIN_STUDY or study > MAX_SESSION_HOURS * 3600:
-        await msg.reply_html(f"فترة المذاكرة لازم تكون من {POMO_MIN_STUDY // 60} دقايق لحد {MAX_SESSION_HOURS} ساعة.")
+    max_h = admin.num(ctx, "max_session_hours", MAX_SESSION_HOURS)
+    if study < POMO_MIN_STUDY or study > max_h * 3600:
+        await msg.reply_html(f"فترة المذاكرة لازم تكون من {POMO_MIN_STUDY // 60} دقايق لحد {max_h} ساعة.")
         return
     if brk < POMO_MIN_BREAK or brk > POMO_MAX_BREAK:
         await msg.reply_html(f"الراحة لازم تكون من {POMO_MIN_BREAK // 60} دقيقة لحد {POMO_MAX_BREAK // 60} دقيقة.")
@@ -705,6 +754,8 @@ async def heart_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     r = msg.reply_to_message
     if not r or not r.from_user or r.from_user.id != ctx.bot.id or r.forum_topic_created:
+        return
+    if not admin.flag(ctx, "f_hearts"):
         return
     try:
         await msg.set_reaction(ReactionEmoji.RED_HEART)
@@ -729,7 +780,7 @@ def _since(period: str):
     if period == "today":
         return day_start()
     if period == "week":
-        return now_utc() - timedelta(days=7)
+        return day_start() - timedelta(days=6)      # آخر 7 أيام تقويمية (النهارده + 6)
     return None
 
 
@@ -860,8 +911,6 @@ async def top_callback(update: Update, ctx, period: str):
         return
     await q.answer()
     msg = q.message
-    if not isinstance(msg, Message):       # رسالة قديمة جدًا (تليجرام مابيرجّعش محتواها): مفيش حاجة نعدّلها
-        return
     buf, caption, _ = await render_board(ctx, msg.chat_id, period, msg.chat.title)
     kb = top_keyboard(period)
     try:
@@ -904,13 +953,9 @@ def dua_keyboard(cat: str, cur: int) -> InlineKeyboardMarkup:
 
 async def _dua_photo(ctx, idx: int):
     """file_id لو البطاقة اتبعتت قبل كده، وإلا بنرسمها في thread (حوالي نص ثانية). None لو الرسم فشل."""
-    bd = ctx.application.bot_data
-    fid = bd.setdefault("dua_file_ids", {}).get(idx)
+    fid = ctx.application.bot_data.setdefault("dua_file_ids", {}).get(idx)
     if fid:
         return fid
-    pre = bd.get("dua_bytes", {}).get(idx)         # اتحضّرت وقت التشغيل: مفيش رسم (كان ~0.3 ثانية)
-    if pre:
-        return pre
     try:
         return await asyncio.to_thread(art.make_dua_card, idx)
     except Exception:
@@ -1025,7 +1070,7 @@ async def challenge_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pool = pool_of(ctx)
 
     if ctx.args:  # تحديد ساعات التحدي = للأدمن فقط
-        if not anon_admin(msg, chat) and not await is_admin(ctx, chat.id, user.id):
+        if not await is_admin_msg(ctx, update):
             await msg.reply_text("تحديد التحدي للأدمنز بس 🔒")
             return
         arg = ctx.args[0].translate(_AR_DIGITS)
@@ -1044,6 +1089,9 @@ async def challenge_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     async with pool.acquire() as c:
         hours = await get_challenge(c, chat.id)
+        if hours is None:
+            await msg.reply_html("مفيش تحدي محدد النهاردة 🤍\nالأدمن يقدر يحدده بـ <code>/challenge 5</code> (عدد الساعات من 1 لـ 24).")
+            return
         rows = await board(c, chat.id, day_start())
         awarded = await c.fetchval("SELECT 1 FROM awards WHERE chat_id=$1 AND day=$2 AND user_id=$3",
                                    chat.id, today(), user.id)
@@ -1055,6 +1103,8 @@ async def award_check(ctx, chat_id: int, thread_id: int | None):
     pool = pool_of(ctx)
     async with pool.acquire() as c:
         ch = await get_challenge_row(c, chat_id)
+        if not ch:
+            return          # مفيش تحدي حدّده الأدمن النهاردة: مفيش شهادات
         rows = await board(c, chat_id, day_start())
     hours = ch["hours"]
     winners = []
@@ -1099,21 +1149,24 @@ async def send_certificate(ctx, chat_id, thread_id, r, hours: int, ch=None):
             r["user_id"], buf,
             caption=(f"🎓 مبروك! خلّصت تحدي اليوم ({certificate.hours_label(hours)} مذاكرة)"
                      + (f" في «{group}»" if group else "") + ".\nبارك الله في جهدك 🤍"))
+        sent_dm = True
     except (Forbidden, BadRequest):
+        sent_dm = False
+    if sent_dm:
+        # الشهادة وصلت الخاص: فشل رسالة الجروب مايتحولش لإرسال الشهادة تاني
+        try:
+            await ctx.bot.send_message(
+                chat_id, f"🏆 مبروك {who}! خلّص تحدي اليوم ({certificate.hours_label(hours)}) والشهادة وصلتله على الخاص 🎓",
+                parse_mode=ParseMode.HTML, **kw)
+        except TelegramError as e:
+            log.warning("certificate group notice failed: %s", e)
+    else:
         # المستخدم ماعملش Start للبوت في الخاص -> نبعتها في الجروب
         buf.seek(0)
         await ctx.bot.send_photo(
             chat_id, buf, parse_mode=ParseMode.HTML, **kw,
             caption=(f"🏆 مبروك {who}! خلّص تحدي اليوم ({certificate.hours_label(hours)}) 🎓\n"
                      f"ابدأ البوت في الخاص عشان الشهادة توصلك مباشرة: https://t.me/{ctx.application.bot_data['username']}"))
-        return
-    # الشهادة وصلت الخاص. لو إشعار الجروب فشل (توبيك اتقفل مثلًا) ماينفعش نبعت الشهادة تاني في الجروب (كان بيحصل تكرار)
-    try:
-        await ctx.bot.send_message(
-            chat_id, f"🏆 مبروك {who}! خلّص تحدي اليوم ({certificate.hours_label(hours)}) والشهادة وصلتله على الخاص 🎓",
-            parse_mode=ParseMode.HTML, **kw)
-    except TelegramError as e:
-        log.warning("certificate group notice failed: %s", e)
 
 
 # ───────────── الإرسال الجماعي ─────────────
@@ -1159,10 +1212,16 @@ def _read(*parts) -> bytes | None:
 
 
 async def daily_challenge_post(ctx: ContextTypes.DEFAULT_TYPE):
-    """كل يوم بنعلن تحدي اليوم في الجروبات اللي استخدمت البوت مؤخرًا."""
+    """بنعلن تحدي اليوم في الجروبات اللي الأدمن حدّد فيها تحدي (البوت مابيختارش ساعات من نفسه)."""
+    if not admin.flag(ctx, "f_challenge"):
+        return
     async with pool_of(ctx).acquire() as c:
-        chats = await recent_chats(c)
-        hours = {ch["chat_id"]: await get_challenge(c, ch["chat_id"]) for ch in chats}
+        hours = {}
+        for ch in await recent_chats(c):
+            h = await get_challenge(c, ch["chat_id"])
+            if h:
+                hours[ch["chat_id"]] = h
+        chats = [ch for ch in await recent_chats(c) if ch["chat_id"] in hours]
 
     async def send(ch):
         await ctx.bot.send_message(ch["chat_id"], challenge_blurb(hours[ch["chat_id"]]),
@@ -1193,7 +1252,8 @@ async def _prayer_times(ctx) -> dict:
             return json.load(r)["data"]["timings"]
     try:
         t = await asyncio.to_thread(fetch)
-        cache.update(date=d, times={k: t[k][:5] for k, _ in PRAYERS}, failed_at=None, fired=set())
+        cache.update(date=d, times={**{k: t[k][:5] for k, _ in PRAYERS}, **({"Imsak": t["Imsak"][:5]} if t.get("Imsak") else {})},
+                     failed_at=None, fired=set())
     except Exception as e:
         log.warning("prayer times fetch failed: %s", e)
         cache["failed_at"] = now_utc()
@@ -1201,33 +1261,188 @@ async def _prayer_times(ctx) -> dict:
     return cache["times"]
 
 
+def _due_at(times: dict, key: str, nowl: datetime, minutes: int = 0) -> datetime:
+    hh, mm = map(int, times[key].split(":"))
+    return nowl.replace(hour=hh, minute=mm, second=0, microsecond=0) + timedelta(minutes=minutes)
+
+
+def _in_window(due: datetime, nowl: datetime) -> bool:
+    return due <= nowl < due + timedelta(minutes=3)
+
+
+async def _claim(ctx, fired: set, key: str) -> bool:
+    """يحجز الحدث مرة واحدة في اليوم: في الذاكرة (سريع) وفي الداتابيز (عشان restart ما يكرّرهوش)."""
+    if key in fired:
+        return False
+    fired.add(key)
+    try:
+        async with pool_of(ctx).acquire() as c:
+            return await fire_once(c, key)
+    except Exception:       # noqa: BLE001  الداتابيز واقعة؟ نكمّل بالحماية اللي في الذاكرة بس
+        log.exception("fire_once failed for %s", key)
+        return True
+
+
+async def hijri_of(ctx, d: date) -> tuple[int, int, int]:
+    """(سنة، شهر، يوم) هجري لتاريخ ميلادي: من aladhan، وعند فشل النت بالتقويم الحسابي (بيتجدد كل ساعة).
+    HIJRI_OFFSET بيزحزح التاريخ لو التقويم مخالف لإعلان دار الإفتاء."""
+    cache = ctx.application.bot_data.setdefault("hijri", {})
+    hit = cache.get(d)
+    if hit and (hit[1] or time.monotonic() - hit[2] < 3600):
+        return hit[0]
+    offset = admin.num(ctx, "hijri_offset", HIJRI_OFFSET)
+    src = d + timedelta(days=offset)
+    url = f"https://api.aladhan.com/v1/gToH/{src.strftime('%d-%m-%Y')}"
+
+    def fetch():
+        with urllib.request.urlopen(url, timeout=10) as r:
+            h = json.load(r)["data"]["hijri"]
+        out = int(h["year"]), int(h["month"]["number"]), int(h["day"])
+        if not (1 <= out[1] <= 12 and 1 <= out[2] <= 30):
+            raise ValueError(f"bad hijri date {out}")
+        return out
+    try:
+        h, from_api = await asyncio.to_thread(fetch), True
+    except Exception as e:      # noqa: BLE001
+        log.warning("hijri date fetch failed (%s): using calculated calendar", e)
+        h, from_api = islamic.hijri_from_gregorian(src), False
+    if len(cache) >= 60:
+        cache.clear()
+    cache[d] = (h, from_api, time.monotonic())
+    return h
+
+
+async def _broadcast_card(ctx, chats, key: str, make, caption: str, what: str, reply_markup=None):
+    """يبعت بطاقة مولّدة بالكود لكل الجروبات (بتترسم مرة وبعدها file_id). لو الرسم فشل بيبعت النص بس."""
+    ids = ctx.application.bot_data.setdefault("islamic_file_ids", {})
+    data = None
+    if key not in ids:
+        try:
+            data = await asyncio.to_thread(make)
+        except Exception:       # noqa: BLE001
+            log.exception("%s card render failed", what)
+
+    async def send(ch):
+        photo = ids.get(key) or data
+        if photo is None:
+            await ctx.bot.send_message(ch["chat_id"], caption, parse_mode=ParseMode.HTML, reply_markup=reply_markup,
+                                       **_kw(ch))
+            return
+        sent = await ctx.bot.send_photo(ch["chat_id"], photo, caption=caption, parse_mode=ParseMode.HTML,
+                                        reply_markup=reply_markup, **_kw(ch))
+        if len(ids) >= 200:
+            ids.clear()
+        ids[key] = sent.photo[-1].file_id
+    await broadcast(ctx, list(chats), send, what)
+
+
+def _card_maker(title: str, text: str, source: str, theme: str, seed: int):
+    return lambda: art.card_jpeg(art.make_text_card(title, text, source, theme, seed=seed))
+
+
+async def _ramadan_events(ctx, times: dict, nowl: datetime, fired: set):
+    """سحور / تراويح / استقبال رمضان / تهنئة العيد. التاريخ الهجري بيتطلب بس لما يكون فيه موعد قرّب."""
+    candidates = [("suhoor", "Fajr", -RAMADAN_SUHOOR_MIN), ("taraweeh", "Isha", RAMADAN_TARAWEEH_MIN),
+                  ("ramadan_welcome", "Isha", 0), ("eid_fitr", "Fajr", 60)]
+    for name, base, off in candidates:
+        if name in fired or base not in times or not _in_window(_due_at(times, base, nowl, off), nowl):
+            continue
+        d = today()
+        h, h_tom = await hijri_of(ctx, d), await hijri_of(ctx, d + timedelta(days=1))
+        night = islamic.tarawih_night(h_tom)
+        card = None                                   # (title, text, source, theme, seed, key)
+        if name == "suhoor" and islamic.is_ramadan(h):
+            t, tx, src, cap = islamic.suhoor_card(h[2], times.get("Imsak", times["Fajr"]), times["Fajr"], RAMADAN_SUHOOR_MIN)
+            card = (t, tx, src, "dawn", 5, "suhoor")
+        elif name == "taraweeh" and night:
+            t, tx, src, cap = islamic.taraweeh_card(night)
+            card = (t, tx, src, "night", 9, f"taraweeh:{night}")
+        elif name == "ramadan_welcome" and night == 1:
+            cap = islamic.ramadan_welcome()
+        elif name == "eid_fitr" and h[1] == islamic.SHAWWAL and h[2] == 1:
+            cap = islamic.eid_greeting()
+        else:
+            fired.add(name)                           # مش النهاردة: ماتحسبش تاني النهاردة
+            continue
+        if not await _claim(ctx, fired, name):
+            continue
+        async with pool_of(ctx).acquire() as c:
+            chats = await recent_chats(c)
+        if card:
+            await _broadcast_card(ctx, chats, card[5], _card_maker(*card[:5]), cap, name)
+        else:
+            async def send(ch, cap=cap):
+                await ctx.bot.send_message(ch["chat_id"], cap, parse_mode=ParseMode.HTML, **_kw(ch))
+            await broadcast(ctx, chats, send, name)
+
+
 async def prayer_tick(ctx: ContextTypes.DEFAULT_TYPE):
-    """في موعد كل صلاة (بتوقيت القاهرة) بنبعت تذكير في الجروبات اللي بتستخدم البوت."""
+    """في موعد كل صلاة (بتوقيت القاهرة) بنبعت تذكير في الجروبات اللي بتستخدم البوت + أحداث رمضان.
+    لو فيه معسكر شغال في الجروب بيتحط تحت الرسالة زرار «وقف المعسكر للصلاة»."""
     times = await _prayer_times(ctx)
     if not times:
         return
     fired = ctx.application.bot_data["prayers"].setdefault("fired", set())
     nowl = datetime.now(TZ)
-    for key, ar in PRAYERS:
-        hh, mm = map(int, times[key].split(":"))
-        due = nowl.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        if key in fired or not (due <= nowl < due + timedelta(minutes=3)):
+    for key, ar in (PRAYERS if admin.flag(ctx, "f_prayer") else []):
+        if key in fired or not _in_window(_due_at(times, key, nowl), nowl):
             continue
-        fired.add(key)
+        if not await _claim(ctx, fired, key):
+            continue
         async with pool_of(ctx).acquire() as c:
             chats = await recent_chats(c)
+            running = await running_session_ids(c)
         caption = f"<b>صلاة {ar}</b> أثابنا الله وإياكم 💖\nلا خير في عمل يلهي عن الصلاة"
+        if key == "Maghrib":
+            h = await hijri_of(ctx, today())
+            if islamic.is_ramadan(h):
+                caption = islamic.iftar_caption(h[2])
         file_ids = ctx.application.bot_data.setdefault("prayer_file_ids", {})
         data = None if key in file_ids else await asyncio.to_thread(_read, "prayers", f"{key.lower()}.jpg")
 
-        async def send(ch, key=key, caption=caption, data=data):
+        async def send(ch, key=key, caption=caption, data=data, running=running):
+            sid = running.get(ch["chat_id"])
+            cap = caption + PRAYER_HINT if sid else caption
+            kb = prayer_keyboard(sid, key) if sid else None
             photo = file_ids.get(key) or data
             if photo is None:
-                await ctx.bot.send_message(ch["chat_id"], caption, parse_mode=ParseMode.HTML, **_kw(ch))
+                await ctx.bot.send_message(ch["chat_id"], cap, parse_mode=ParseMode.HTML, reply_markup=kb, **_kw(ch))
                 return
-            sent = await ctx.bot.send_photo(ch["chat_id"], photo, caption=caption, parse_mode=ParseMode.HTML, **_kw(ch))
+            sent = await ctx.bot.send_photo(ch["chat_id"], photo, caption=cap, parse_mode=ParseMode.HTML,
+                                            reply_markup=kb, **_kw(ch))
             file_ids[key] = sent.photo[-1].file_id            # رفع مرة واحدة وبعدها file_id
         await broadcast(ctx, chats, send, f"prayer {key}")
+    if admin.flag(ctx, "f_ramadan"):
+        await _ramadan_events(ctx, times, nowl, fired)
+
+
+async def fasting_post(ctx: ContextTypes.DEFAULT_TYPE):
+    """بالليل: لو بكرة يوم صيام نافلة (اثنين/خميس/أيام بيض/عرفة/عاشوراء/ستّ شوّال) نفكّر الجروبات."""
+    if not admin.flag(ctx, "f_fasting"):
+        return
+    tomorrow = today() + timedelta(days=1)
+    reasons = islamic.fasting_reasons(tomorrow, await hijri_of(ctx, tomorrow))
+    if not reasons:
+        return
+    title, text, source, cap = islamic.fasting_card(reasons, tomorrow)
+    async with pool_of(ctx).acquire() as c:
+        if not await fire_once(c, "fasting"):          # الداتابيز بس (مفيش set في الذاكرة بيتصفّر يوميًا هنا)
+            return
+        chats = await recent_chats(c)
+    await _broadcast_card(ctx, chats, f"fast:{text}", _card_maker(title, text, source, "emerald", 3), cap, "fasting")
+
+
+async def ramadan_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/ramadan: يوم رمضان + الإمساك والإفطار + الورد المقترح (أو الأيام المتبقية لو مش رمضان)."""
+    msg = update.effective_message
+    h = await hijri_of(ctx, today())
+    if not islamic.is_ramadan(h):
+        n = islamic.days_until_ramadan(today(), admin.num(ctx, "hijri_offset", HIJRI_OFFSET))
+        left = f"\nفاضل حوالي <b>{n}</b> يوم على رمضان (حسب التقويم) 🌙" if n > 0 else ""
+        await msg.reply_html(f"🌙 مش في رمضان دلوقتي.\n📅 التاريخ الهجري: <b>{islamic.hijri_label(h)}</b>{left}",
+                             **thread_kwargs(msg))
+        return
+    await msg.reply_html(islamic.ramadan_status(h, await _prayer_times(ctx)), **thread_kwargs(msg))
 
 
 async def _send_adhkar(ctx, chat_id: int, kind: str, thread_id: int | None = None):
@@ -1250,6 +1465,8 @@ async def _send_adhkar(ctx, chat_id: int, kind: str, thread_id: int | None = Non
 async def adhkar_post(ctx: ContextTypes.DEFAULT_TYPE):
     """نشر ذكر الصباح أو المساء في الجروبات النشطة."""
     kind = ctx.job.data
+    if not admin.flag(ctx, "f_adhkar"):
+        return
     async with pool_of(ctx).acquire() as c:
         chats = await recent_chats(c)
 
@@ -1261,29 +1478,21 @@ async def adhkar_post(ctx: ContextTypes.DEFAULT_TYPE):
 async def adhkar_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kind = "morning" if datetime.now(TZ).hour < 12 else "evening"
     msg = update.effective_message
-    # thread_kwargs مش message_thread_id الخام: في الجروبات العادية الرد على رسالة بيحمل thread id وتليجرام بيرفض الإرسال بيه
-    await _send_adhkar(ctx, update.effective_chat.id, kind, thread_kwargs(msg).get("message_thread_id"))
+    await _send_adhkar(ctx, update.effective_chat.id, kind, getattr(msg, "message_thread_id", None))
 
 
 async def friday_post(ctx: ContextTypes.DEFAULT_TYPE):
     """الجمعة: تذكير بسورة الكهف والصلاة على النبي + الصورتين."""
-    if datetime.now(TZ).weekday() != 4:   # الجمعة
+    if datetime.now(TZ).weekday() != 4 or not admin.flag(ctx, "f_friday"):   # الجمعة
         return
     async with pool_of(ctx).acquire() as c:
         chats = await recent_chats(c)
-    file_ids = ctx.application.bot_data.setdefault("friday_file_ids", {})
-    if file_ids:
-        kahf, salawat = file_ids["kahf"], file_ids["salawat"]
-    else:
-        kahf, salawat = await asyncio.gather(asyncio.to_thread(_read, "kahf.jpg"), asyncio.to_thread(_read, "salawat.jpg"))
+    kahf, salawat = await asyncio.gather(asyncio.to_thread(_read, "kahf.jpg"), asyncio.to_thread(_read, "salawat.jpg"))
     caption = "لا تنسوا قراءة سورة الكهف\nوالصلاة على النبي ﷺ 💖"
 
     async def send(ch):
-        msgs = await ctx.bot.send_media_group(
-            ch["chat_id"], [InputMediaPhoto(file_ids.get("kahf") or kahf, caption=caption),
-                            InputMediaPhoto(file_ids.get("salawat") or salawat)], **_kw(ch))
-        if not file_ids and len(msgs) == 2 and all(getattr(m, "photo", None) for m in msgs):
-            file_ids.update(kahf=msgs[0].photo[-1].file_id, salawat=msgs[1].photo[-1].file_id)   # رفع مرة واحدة بس
+        await ctx.bot.send_media_group(
+            ch["chat_id"], [InputMediaPhoto(kahf, caption=caption), InputMediaPhoto(salawat)], **_kw(ch))
     if not (kahf and salawat):
         log.warning("friday images missing")
         return
@@ -1292,6 +1501,8 @@ async def friday_post(ctx: ContextTypes.DEFAULT_TYPE):
 
 async def daily_leaderboard_post(ctx: ContextTypes.DEFAULT_TYPE):
     """كل يوم 8 بالليل: لوحة شرف النهاردة (صورة) + بطل اليوم + رسالة التوفيق."""
+    if not admin.flag(ctx, "f_leaderboard"):
+        return
     async with pool_of(ctx).acquire() as c:
         chats = await recent_chats(c)
 
@@ -1313,42 +1524,27 @@ async def daily_leaderboard_post(ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ───────────── التشغيل ─────────────
-def _prerender_duas(cache: dict):
-    for i in range(len(DUA_ITEMS)):
-        if i not in cache:
-            cache[i] = art.make_dua_card(i)
-
-
-async def _warmup(app: Application | None = None):
-    """أول شهادة/لوحة بتحتاج تحميل الخطوط وبناء الخلفيات الثابتة؛ بنعملها مرة وقت التشغيل عشان محدش يستنى.
-    كروت الأدعية كلها بتتحضّر كمان (بايتات في الذاكرة) فأول /dua لأي دعاء بيتبعت فورًا."""
+async def _warmup():
+    """أول شهادة/لوحة بتحتاج تحميل الخطوط وبناء الخلفيات الثابتة؛ بنعملها مرة وقت التشغيل عشان محدش يستنى."""
     t0 = time.monotonic()
     try:
         await asyncio.to_thread(certificate.warmup)
         await asyncio.to_thread(leaderboard.warmup)
         await asyncio.to_thread(timercard.warmup)
         log.info("warmup done in %.1fs", time.monotonic() - t0)
-        if app is not None:
-            await asyncio.to_thread(_prerender_duas, app.bot_data.setdefault("dua_bytes", {}))
-            log.info("dua cards ready (%.1fs)", time.monotonic() - t0)
     except Exception:
         log.exception("warmup failed")
 
 
 async def post_init(app: Application):
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=DB_POOL_MAX, command_timeout=30)
+    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10, command_timeout=30)
     async with pool.acquire() as c:
         await c.execute(SCHEMA)
+        await backfill_study_days(c)
     app.bot_data["pool"] = pool
+    await admin.setup_db(app)                                   # جداول اللوحة + الإعدادات
     app.bot_data["username"] = (await app.bot.get_me()).username
-    app.bot_data["warmup_task"] = asyncio.create_task(_warmup(app))        # بنسخّن الخطوط والخلفيات من غير ما نعطّل التشغيل
-    try:
-        await _set_commands(app)
-    except TelegramError as e:                 # فشل تسجيل قايمة الأوامر مايوقّفش البوت كله
-        log.warning("set_my_commands failed: %s", e)
-
-
-async def _set_commands(app: Application):
+    app.bot_data["warmup_task"] = asyncio.create_task(_warmup())          # بنسخّن الخطوط والخلفيات من غير ما نعطّل التشغيل
     await app.bot.set_my_commands([
         BotCommand("start", "ابدأ معسكر مذاكرة — مثال: /start 2h"),
         BotCommand("stop", "إيقاف المؤقت"),
@@ -1360,7 +1556,11 @@ async def _set_commands(app: Application):
         BotCommand("dua", "دعاء للمذاكرة بصورة (/dua امتحان أو /dua حفظ)"),
         BotCommand("adhkar", "ذكر الصباح أو المساء"),
         BotCommand("pomodoro", "ضبط المذاكرة والراحة (للأدمن) — مثال: /pomodoro 2h 10m"),
+        BotCommand("pray", "وقف المعسكر للصلاة (ويكمّل تلقائي)"),
+        BotCommand("ramadan", "مواعيد رمضان والورد المقترح"),
+        BotCommand("id", "أيدي حسابك والشات"),
     ])
+    await admin.announce_boot(app)
 
 
 async def post_shutdown(app: Application):
@@ -1371,30 +1571,6 @@ async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
     log.error("unhandled error while handling update %s", update, exc_info=ctx.error)
 
 
-def _build_requests():
-    """اتصالات تليجرام. الافتراضي في httpx إنه يقفل أي اتصال فاضي بعد 5 ثواني، فأول أمر بعد فترة هدوء كان بيدفع
-    handshake TLS كامل (100-300ms). هنا الاتصالات بتفضل مفتوحة KEEPALIVE ثانية. HTTP/2 اختياري (TG_HTTP2=1)."""
-    import httpx
-    from telegram.request import HTTPXRequest
-
-    version = "1.1"
-    if os.getenv("TG_HTTP2", "0") == "1":
-        try:
-            import h2  # noqa: F401
-            version = "2"
-        except ImportError:
-            log.warning("TG_HTTP2=1 لكن حزمة h2 مش متثبتة (pip install 'httpx[http2]'): هنكمّل بـ HTTP/1.1")
-
-    def limits(n):
-        return httpx.Limits(max_connections=n, max_keepalive_connections=n, keepalive_expiry=TG_KEEPALIVE)
-    req = HTTPXRequest(connection_pool_size=64, pool_timeout=20, connect_timeout=10, read_timeout=20,
-                       write_timeout=30,                   # write_timeout أطول لرفع الصور
-                       http_version=version, httpx_kwargs={"limits": limits(64)})
-    upd_req = HTTPXRequest(connection_pool_size=2, connect_timeout=10, http_version=version,
-                           httpx_kwargs={"limits": limits(2)})
-    return req, upd_req
-
-
 def main():
     if os.getenv("USE_UVLOOP", "0") == "1":              # لوب أسرع بحوالي 2x لو uvloop متثبّت (اختياري)
         try:
@@ -1403,27 +1579,33 @@ def main():
             log.info("uvloop شغال")
         except Exception:
             pass
-    req, upd_req = _build_requests()
     app = (Application.builder().token(TOKEN).post_init(post_init).post_shutdown(post_shutdown)
            .concurrent_updates(32)                         # أمر بطيء (لوحة/شهادة) ميوقّفش باقي الرسايل والأزرار
-           .request(req).get_updates_request(upd_req)
+           .connection_pool_size(64).pool_timeout(20)      # الافتراضي اتصال HTTP واحد: كل طلبات تليجرام كانت بتتسلسل
+           .get_updates_connection_pool_size(2)
+           .connect_timeout(10).read_timeout(20).write_timeout(30)   # write_timeout أطول لرفع الصور
            .build())
     for name, fn in [("start", start_cmd), ("help", help_cmd), ("stop", stop_cmd), ("ready", ready_cmd),
                      ("end", end_cmd), ("me", me_cmd), ("top", top_cmd), ("challenge", challenge_cmd),
-                     ("dua", dua_cmd), ("adhkar", adhkar_cmd), ("pomodoro", pomodoro_cmd), ("pomo", pomodoro_cmd)]:
+                     ("dua", dua_cmd), ("adhkar", adhkar_cmd), ("pomodoro", pomodoro_cmd), ("pomo", pomodoro_cmd),
+                     ("pray", pray_cmd), ("ramadan", ramadan_cmd)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.REPLY & filters.ChatType.GROUPS, heart_reply))
     app.add_handler(CallbackQueryHandler(on_button, pattern=r"^(join|pause|resume|end|top):"))
     app.add_handler(CallbackQueryHandler(dua_callback, pattern=r"^dua:"))
+    app.add_handler(CallbackQueryHandler(pray_callback, pattern=r"^pray:"))
     app.add_error_handler(on_error)
+    admin.register(app, {"pause_session": pause_session, "resume_session": resume_session, "end_early": end_early,
+                         "mark_dead": _mark_dead})          # لوحة تحكم المالك (/admin): البوابة group=-1
     app.job_queue.run_repeating(tick, interval=TICK_SECONDS, first=3)
     app.job_queue.run_daily(daily_challenge_post, time=dtime(CHALLENGE_DAILY_HOUR, 0, tzinfo=TZ))
     app.job_queue.run_daily(daily_leaderboard_post, time=dtime(LEADERBOARD_HOUR, 0, tzinfo=TZ))
     app.job_queue.run_daily(adhkar_post, time=dtime(ADHKAR_MORNING_HOUR, 0, tzinfo=TZ), data="morning")
     app.job_queue.run_daily(adhkar_post, time=dtime(ADHKAR_EVENING_HOUR, 0, tzinfo=TZ), data="evening")
     app.job_queue.run_daily(friday_post, time=dtime(10, 0, tzinfo=TZ))
+    app.job_queue.run_daily(fasting_post, time=dtime(FASTING_REMIND_HOUR, 0, tzinfo=TZ))
     app.job_queue.run_repeating(prayer_tick, interval=30, first=10)
-    app.run_polling(allowed_updates=["message", "callback_query"], bootstrap_retries=-1)   # -1: يعيد المحاولة لو النت وقع وقت التشغيل
+    app.run_polling(allowed_updates=["message", "callback_query", "my_chat_member"])
 
 
 if __name__ == "__main__":

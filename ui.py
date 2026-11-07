@@ -41,6 +41,9 @@ WELCOME = (
     "• /top — لوحة الشرف\n"
     "• /challenge — تحدي اليوم والشهادة\n\n"
     "🤲 <b>روحانيات</b>\n"
+    "• /pray — وقف المعسكر وقت الصلاة (ويكمّل لوحده بعد شوية)، وفي زرار تحت رسالة الأذان\n"
+    "• /ramadan — مواعيد رمضان والورد المقترح (وضع رمضان بيشتغل لوحده: سحور، إفطار، تراويح)\n"
+    "• البوت بيفكّر بصيام النوافل (الاثنين والخميس والأيام البيض وعرفة وعاشوراء...)\n"
     "• /dua — دعاء للمذاكرة بصورة (<code>/dua امتحان</code> أو <code>/dua حفظ</code> لدعاء مخصوص)\n"
     "• /adhkar — ذكر الصباح أو المساء (والبوت بيبعتهم يوميًا)\n\n"
     "🎓 الشهادات بتوصلك هنا في الخاص، فخلي المحادثة دي مفتوحة."
@@ -53,12 +56,17 @@ def session_text(s: dict, count: int, names: list[str], bot_username: str, now: 
     remaining = max(0, s["duration"] - e)
     done, paused = s["status"] == "done", s["status"] == "paused"
     brk = s.get("break_until") if paused else None
+    pray = s.get("prayer_until") if paused and not brk else None
     if done:
         rem, end = "<code>00:00:00</code>  ✅ انتهى", fmt_time(s["ended_at"] or now)
     elif brk:
         left = max(0, (brk - now).total_seconds())
         rem = f"<code>{fmt_clock(remaining)}</code>  ☕ استراحة — باقي <code>{fmt_clock(left)}</code>"
         end = fmt_time(brk + timedelta(seconds=remaining))
+    elif pray:
+        left = max(0, (pray - now).total_seconds())
+        rem = f"<code>{fmt_clock(remaining)}</code>  🕌 وقفة للصلاة — نرجع بعد <code>{fmt_clock(left)}</code>"
+        end = fmt_time(pray + timedelta(seconds=remaining))
     elif paused:
         rem, end = f"<code>{fmt_clock(remaining)}</code>  ⏸ متوقف مؤقتًا", "—"
     else:
@@ -99,8 +107,10 @@ def session_text(s: dict, count: int, names: list[str], bot_username: str, now: 
     return "\n".join(out)
 
 
-def session_keyboard(sid: int, status: str = "running", on_break: bool = False) -> InlineKeyboardMarkup:
-    resume_label = "⏭ كمّل مذاكرة (تخطي الراحة)" if on_break else "▶️ استئناف"
+def session_keyboard(sid: int, status: str = "running", on_break: bool = False,
+                     on_prayer: bool = False) -> InlineKeyboardMarkup:
+    resume_label = ("⏭ كمّل مذاكرة (تخطي الراحة)" if on_break
+                    else "▶️ خلصنا الصلاة — كمّل" if on_prayer else "▶️ استئناف")
     toggle = (InlineKeyboardButton(resume_label, callback_data=f"resume:{sid}") if status == "paused"
               else InlineKeyboardButton("⏸ إيقاف", callback_data=f"pause:{sid}"))
     return InlineKeyboardMarkup([
@@ -248,3 +258,21 @@ def break_caption(break_secs: float, back_at: datetime, n: int) -> str:
 def study_back_caption(block_secs: float, n: int) -> str:
     return (f"📚 <b>رجعنا نذاكر</b> — الفترة {n}: {ar_duration(block_secs)}\n"
             "الراحة خلصت، ركّز وربنا يوفقك 💪")
+
+
+# ───────────── الصلاة أثناء المعسكر ─────────────
+def prayer_keyboard(sid: int, key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🕌 وقف المعسكر للصلاة", callback_data=f"pray:{sid}:{key}")]])
+
+
+PRAYER_HINT = "\n\n📚 معسكركم شغال؟ اضغط الزر عشان يوقف المؤقت وقت الصلاة ويكمّل تلقائي بعدها."
+
+
+def pray_started_text(minutes: int) -> str:
+    return (f"🕌 وقفنا المؤقت للصلاة. تقبّل الله منكم!\n"
+            f"هيكمّل تلقائي بعد <b>{minutes}</b> دقيقة، أو اضغط «خلصنا الصلاة» أو /ready لو خلصتوا قبل كده.\n"
+            "<i>وقت الصلاة مش بيتحسب مذاكرة.</i>")
+
+
+def pray_resumed_text() -> str:
+    return "📚 رجعنا نذاكر. تقبّل الله صلاتكم ووفقكم 🤍"

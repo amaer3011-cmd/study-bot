@@ -73,17 +73,26 @@ def _ctx(pool):
 
 @pytest.fixture
 async def pool():
+    """بنشتغل جوه schema مؤقت لكل اختبار: مفيش أي لمس لـ public حتى لو DATABASE_URL لقاعدة حقيقية."""
+    import uuid
     import asyncpg
+    schema = "t_" + uuid.uuid4().hex[:12]
     try:
-        p = await asyncpg.create_pool(os.environ["DATABASE_URL"], min_size=1, max_size=3, command_timeout=30)
+        admin = await asyncpg.connect(os.environ["DATABASE_URL"])
+        await admin.execute(f'CREATE SCHEMA "{schema}"')
+        p = await asyncpg.create_pool(os.environ["DATABASE_URL"], min_size=1, max_size=3, command_timeout=30,
+                                      server_settings={"search_path": schema})
     except Exception as e:
         pytest.skip(f"no postgres: {e}")
-    async with p.acquire() as c:
-        await c.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
-        await c.execute(bot.SCHEMA)
-        await c.execute(bot.SCHEMA)                               # لازم يتنفّذ مرتين من غير مشاكل (إعادة تشغيل)
-    yield p
-    await p.close()
+    try:
+        async with p.acquire() as c:
+            await c.execute(bot.SCHEMA)
+            await c.execute(bot.SCHEMA)                           # لازم يتنفّذ مرتين من غير مشاكل (إعادة تشغيل)
+        yield p
+    finally:
+        await p.close()
+        await admin.execute(f'DROP SCHEMA "{schema}" CASCADE')
+        await admin.close()
 
 
 async def _mk_session(pool, chat=-100, duration=3600, parts=((1, "a"), (2, "b"))):
@@ -215,9 +224,9 @@ async def test_rosters_and_challenge_row(pool):
     async with pool.acquire() as c:
         r = await db.rosters(c, [s["id"]])
         assert r[s["id"]][0] == 9 and len(r[s["id"]][1]) == db.ROSTER_NAMES
-        a = await db.get_challenge_row(c, -100)
-        b = await db.get_challenge_row(c, -100)
-        assert a["hours"] == b["hours"] and 1 <= a["hours"] <= 12
+        assert await db.get_challenge_row(c, -100) is None and await db.get_challenge(c, -100) is None   # مفيش تحدي تلقائي
+        await c.execute("INSERT INTO challenges(chat_id,day,hours) VALUES(-100,$1,4)", db.today())
+        assert await db.get_challenge(c, -100) == 4
 
 
 def _query(data, uid, chat=-100):

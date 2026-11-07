@@ -2,8 +2,10 @@
 """كل الإعدادات (متغيرات البيئة) واللوجنج في مكان واحد. القيم الافتراضية في .env.example."""
 import logging
 import os
+import re
 from zoneinfo import ZoneInfo
 
+VERSION = "5.4.0"
 ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 
 # ── أساسية ──
@@ -13,13 +15,14 @@ if not TOKEN or not DATABASE_URL:
     raise SystemExit("لازم تضبط BOT_TOKEN و DATABASE_URL في متغيرات البيئة (شوف .env.example)")
 TZ = ZoneInfo(os.getenv("TZ_NAME", "Africa/Cairo"))
 
+# ── لوحة تحكم المالك: أيديهات المسموحلها (مفصولة بفاصلة). معرفة أيديك: /id ──
+OWNER_IDS = frozenset(int(x) for x in re.findall(r"\d+", os.getenv("OWNER_IDS", "")))
+
 # ── الجلسات ──
 TICK_SECONDS = int(os.getenv("TICK_SECONDS", "10"))                  # كل كام ثانية يتحدث التايمر
 MAX_SESSION_HOURS = int(os.getenv("MAX_SESSION_HOURS", "12"))
 MAX_PAUSE_HOURS = float(os.getenv("MAX_PAUSE_HOURS", "3"))           # موقوفة أكتر من كده = بتتقفل تلقائي
-DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "20"))                    # اتصالات الداتابيز (الأوامر بتشتغل بالتوازي)
-TG_KEEPALIVE = float(os.getenv("TG_KEEPALIVE", "120"))               # ثواني بقاء اتصال تليجرام مفتوح وهو فاضي
-CONFIRM_END_SECONDS = 6                                            # ضغطتين على زر الإنهاء خلال المدة دي = تأكيد
+CONFIRM_END_SECONDS = 6                                              # ضغطتين على زر الإنهاء خلال المدة دي = تأكيد
 
 # ── البومودورو (حدود اللي الأدمن يقدر يضبطه بـ /pomodoro) ──
 POMO_MIN_STUDY = 5 * 60            # أقل فترة مذاكرة
@@ -38,6 +41,17 @@ PRAYER_CITY = os.getenv("PRAYER_CITY", "Cairo")
 PRAYER_COUNTRY = os.getenv("PRAYER_COUNTRY", "Egypt")
 ADHKAR_MORNING_HOUR = int(os.getenv("ADHKAR_MORNING_HOUR", "7"))
 ADHKAR_EVENING_HOUR = int(os.getenv("ADHKAR_EVENING_HOUR", "17"))
+
+# ── وقف المعسكر للصلاة ──
+PRAYER_PAUSE_MIN = int(os.getenv("PRAYER_PAUSE_MIN", "15"))          # مدة وقفة الصلاة الافتراضية (دقايق)، بعدها يكمّل تلقائي
+PRAYER_PAUSE_MAX = 45                                                # أقصى مدة /pray
+PRAYER_BUTTON_WINDOW_MIN = 45                                        # زر الصلاة بيشتغل لحد كام دقيقة بعد الأذان
+
+# ── التقويم الهجري وصيام النوافل ووضع رمضان ──
+HIJRI_OFFSET = int(os.getenv("HIJRI_OFFSET", "0"))                   # لو التقويم متقدم/متأخر يوم عن دار الإفتاء: -1 أو +1
+FASTING_REMIND_HOUR = int(os.getenv("FASTING_REMIND_HOUR", "21"))    # ساعة تذكير صيام بكرة (بتوقيت TZ_NAME)
+RAMADAN_SUHOOR_MIN = int(os.getenv("RAMADAN_SUHOOR_MIN", "45"))      # تذكير السحور قبل الفجر بكام دقيقة
+RAMADAN_TARAWEEH_MIN = int(os.getenv("RAMADAN_TARAWEEH_MIN", "20"))  # تذكير التراويح بعد العشاء بكام دقيقة
 
 # ── الإرسال الجماعي (جروبات كتير): كام جروب بالتوازي. تليجرام بيسمح بحوالي 30 رسالة/ثانية ──
 BROADCAST_CONCURRENCY = int(os.getenv("BROADCAST_CONCURRENCY", "8"))
